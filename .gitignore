@@ -1,0 +1,6 @@
+model
+build/
+build-*/
+third_party/onnxruntime/
+*.part
+__pycache__/
