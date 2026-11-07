@@ -11,8 +11,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - name: ONNX Runtime (prebuilt release)
@@ -23,11 +21,14 @@ jobs:
           cmake --build build -j 4
       - name: Smoke (no model)
         run: ./build/arctag_cli --help
-      - name: Fetch model (needs the HF_TOKEN repository secret; skipped without it)
-        if: env.HF_TOKEN != ''
-        run: ./scripts/fetch_model.sh
-      - name: Tests (tokenizer + C vs Python reference parity)
-        if: env.HF_TOKEN != ''
+      - name: Model tests (tokenizer + C vs Python parity; need the HF_TOKEN repository secret)
         env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           ARCTAG_THREADS: "2"
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN secret not set: skipping the model download and the model tests"
+            exit 0
+          fi
+          ./scripts/fetch_model.sh
+          ctest --test-dir build --output-on-failure
