@@ -244,3 +244,9 @@ python/arctag_ref.py  Python reference
 scripts/              download_onnxruntime.sh/.ps1, fetch_model.sh
 third_party/cjson     cJSON 1.7.19 (MIT)
 ```
+
+## Licence
+
+Code (including this inference code) and model weights: CC BY-NC 4.0 plus the Whissle terms in [LICENSE](LICENSE),
+non-commercial use only. Commercial use needs a separate written licence from Whissle Inc.: ksingla@whissle.ai.
+Third-party components keep their own licences: see [NOTICE](NOTICE).
