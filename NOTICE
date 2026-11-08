@@ -1,0 +1,9 @@
+arc-tagger-c (Arc Tagger C API)
+Copyright (c) 2026 Whissle Inc. Licensed under the Creative Commons Attribution-NonCommercial 4.0 International License
+(CC BY-NC 4.0) and the Whissle terms in LICENSE; commercial use requires a separate written licence from Whissle Inc.
+(ksingla@whissle.ai, https://whissle.ai).
+
+Third-party components keep their own licences:
+
+- cJSON 1.7.19 (third_party/cjson), MIT License, see third_party/cjson/LICENSE.
+- ONNX Runtime (Microsoft), MIT License. It is downloaded by scripts/download_onnxruntime.sh and is not included here.
