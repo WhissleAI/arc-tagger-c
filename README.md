@@ -67,6 +67,23 @@ Without the script:
 The rest of that repo is the PyTorch checkpoint and the Python package (`arctag/`, `example.py`). This C repo does not
 need it.
 
+### Int8 weights
+
+`tools/quantize_model.py` stores the weight tables as int8, which takes `arctag.onnx` from 34 MB to 9.4 MB. Inference still
+runs in float. The library folds the tables back to float when it loads the model (`session.disable_quant_qdq`), so the
+smaller file saves disk and download size but not RAM or time:
+
+| measured with `arctag_tag_text`, 1 thread | fp32 | int8 |
+|---|---|---|
+| file | 34.0 MB | 9.4 MB |
+| 8 / 32 / 150 words, median ms | 4.2 / 11.3 / 60 | 4.0 / 12.3 / 54 |
+| peak footprint after 150 words | 125-131 MB | 128-131 MB |
+
+Numbers are from a busy Mac, so compare the columns and don't read them as absolute. Without folding, as in the first
+version of the tool, int8 peaks near 60 MB but re-runs every `DequantizeLinear` node on each call. That costs about 4-8 ms
+per call, which makes 8-word texts about 3x slower than fp32. Scores differ from fp32 slightly; compare on your own gold
+labels before shipping a quantized model.
+
 ## API (`include/arctag.h`)
 
 ```c
@@ -102,7 +119,7 @@ arctag_destroy(h);
 | `void arctag_free_str(char*)`, `void arctag_destroy(arctag_t*)`, `const char *arctag_version(void)` | |
 
 A handle is not thread-safe. Use one handle per thread; each handle holds its own ONNX Runtime session. Memory is about
-90 MB RSS for short inputs. The attention and SSM terms are quadratic in the window, so a full 2048-word pass peaks near
+130 MB RSS for short inputs (macOS arm64, ORT 1.20.1), for both the fp32 and int8 models. The attention and SSM terms are quadratic in the window, so a full 2048-word pass peaks near
 1 GB; lower `max_ctx` to reduce it. `ARCTAG_THREADS=n` sets the default number of ONNX Runtime threads.
 
 **Options**

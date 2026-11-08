@@ -4,7 +4,8 @@
   python tools/quantize_model.py model/arctag.onnx out/arctag.onnx
 
 Only the weights are int8: each table has one scale per column and is converted back to float when the model loads, and
-inference runs in float. Do not use ONNX Runtime's dynamic quantization or MatMulNBits here. They change earlier scores
+inference runs in float. This saves disk, not RAM. The load-time conversion needs the session option
+session.disable_quant_qdq=1, which the C library sets. Without it, ORT re-runs the conversion on every call. Do not use ONNX Runtime's dynamic quantization or MatMulNBits here. They change earlier scores
 as more words arrive, which breaks streaming (tests/test_parity.c fails on both). Needs: numpy, onnx.
 """
 import os

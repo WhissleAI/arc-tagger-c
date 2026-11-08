@@ -210,6 +210,10 @@ static int open_session(arctag_t *h) {
     ORT_CHECK(h, h->ort->SetIntraOpNumThreads(so, h->threads));
     ORT_CHECK(h, h->ort->SetInterOpNumThreads(so, 1));
     ORT_CHECK(h, h->ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
+    /* An int8 model (tools/quantize_model.py) stores its weights behind DequantizeLinear nodes. By default ORT keeps those
+     * nodes for its QDQ passes and re-runs them on every call (about 4 ms). With QDQ passes off they fold into float
+     * initializers at load. No effect on an fp32 model, which has no such nodes. */
+    ORT_CHECK(h, h->ort->AddSessionConfigEntry(so, "session.disable_quant_qdq", "1"));
 #ifdef _WIN32
     {
         int n = MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, NULL, 0);

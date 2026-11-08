@@ -64,6 +64,7 @@ class ArcTagger:
         self.meta = json.load(open(os.path.join(model_dir, "arctag_meta.json")))
         self.tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
         so = ort.SessionOptions(); so.intra_op_num_threads = threads; so.inter_op_num_threads = 1
+        so.add_session_config_entry("session.disable_quant_qdq", "1")  # as the C library: int8 tables fold into float at load
         self.sess = ort.InferenceSession(os.path.join(model_dir, "arctag.onnx"), so, providers=["CPUExecutionProvider"])
         self.out_names = [o.name for o in self.sess.get_outputs()]
         self.cn = self.meta["readouts"]
