@@ -112,7 +112,9 @@ static void seterr(char *err, size_t errlen, const char *msg, const char *x) {
 
 static char *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    long n = -1;
+    if (!fseek(f, 0, SEEK_END)) n = ftell(f);
+    if (n < 0 || fseek(f, 0, SEEK_SET)) { fclose(f); return NULL; }
     char *b = (char *)malloc((size_t)n + 1);
     if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
     fclose(f);
@@ -130,35 +132,49 @@ arctok_t *arctok_load(const char *path, char *err, size_t errlen) {
     cJSON *vocab = model ? cJSON_GetObjectItem(model, "vocab") : NULL;
     cJSON *merges = model ? cJSON_GetObjectItem(model, "merges") : NULL;
     cJSON *type = model ? cJSON_GetObjectItem(model, "type") : NULL;
-    if (!t || !vocab || !merges || !cJSON_IsString(type) || strcmp(type->valuestring, "BPE")) {
-        seterr(err, errlen, "tokenizer.json: expected a BPE model with vocab + merges", NULL);
+    if (!t || !cJSON_IsObject(vocab) || !cJSON_IsArray(merges) || !cJSON_IsString(type) || strcmp(type->valuestring, "BPE")) {
+        seterr(err, errlen, t ? "tokenizer.json: expected a BPE model with vocab + merges" : "out of memory", NULL);
         cJSON_Delete(j); free(t); return NULL;
     }
-    hm_init(&t->vocab, (size_t)cJSON_GetArraySize(vocab));
-    hm_init(&t->merges, (size_t)cJSON_GetArraySize(merges));
-    for (cJSON *v = vocab->child; v; v = v->next) hm_put(&t->vocab, v->string, strlen(v->string), (int32_t)v->valuedouble);
+    if (hm_init(&t->vocab, (size_t)cJSON_GetArraySize(vocab)) || hm_init(&t->merges, (size_t)cJSON_GetArraySize(merges))) goto oom;
+    for (cJSON *v = vocab->child; v; v = v->next) {
+        /* an out-of-range id is the caller's to reject; the forward pass clamps ids to the table */
+        double id = cJSON_IsNumber(v) ? v->valuedouble : 0;
+        if (v->string && hm_put(&t->vocab, v->string, strlen(v->string), id >= 0 && id < 2147483647.0 ? (int32_t)id : 0)) goto oom;
+    }
     int rank = 0; char buf[1024];
     for (cJSON *m = merges->child; m; m = m->next, rank++) {
         const char *a = NULL, *b = NULL;
-        if (cJSON_IsArray(m) && cJSON_GetArraySize(m) == 2) { a = cJSON_GetArrayItem(m, 0)->valuestring; b = cJSON_GetArrayItem(m, 1)->valuestring; }
+        if (cJSON_IsArray(m) && cJSON_GetArraySize(m) == 2) {
+            cJSON *ma = cJSON_GetArrayItem(m, 0), *mb = cJSON_GetArrayItem(m, 1);
+            if (cJSON_IsString(ma) && cJSON_IsString(mb)) { a = ma->valuestring; b = mb->valuestring; }
+        }
         else if (cJSON_IsString(m)) {                               /* old format "a b" */
             snprintf(buf, sizeof buf, "%s", m->valuestring);
-            hm_put(&t->merges, buf, strlen(buf), rank); continue;
+            if (hm_put(&t->merges, buf, strlen(buf), rank)) goto oom;
+            continue;
         }
         if (!a || !b) continue;
         int k = snprintf(buf, sizeof buf, "%s %s", a, b);
-        if (k > 0 && (size_t)k < sizeof buf) hm_put(&t->merges, buf, (size_t)k, rank);
+        if (k > 0 && (size_t)k < sizeof buf && hm_put(&t->merges, buf, (size_t)k, rank)) goto oom;
     }
     cJSON *added = cJSON_GetObjectItem(j, "added_tokens");
     for (cJSON *a = added ? added->child : NULL; a && t->n_added < MAX_ADDED; a = a->next) {
         cJSON *c = cJSON_GetObjectItem(a, "content"), *id = cJSON_GetObjectItem(a, "id");
         if (cJSON_IsString(c) && cJSON_IsNumber(id) && c->valuestring[0]) {
-            t->added[t->n_added] = strdup(c->valuestring); t->added_id[t->n_added++] = (int32_t)id->valuedouble;
+            size_t cn = strlen(c->valuestring) + 1; char *d = (char *)malloc(cn);
+            if (!d) goto oom;
+            memcpy(d, c->valuestring, cn);
+            t->added[t->n_added] = d; t->added_id[t->n_added++] = id->valuedouble >= 0 && id->valuedouble < 2147483647.0 ? (int32_t)id->valuedouble : 0;
         }
     }
     cJSON_Delete(j);
     build_bytemap(t);
     return t;
+oom:
+    seterr(err, errlen, "out of memory", NULL);
+    cJSON_Delete(j); arctok_free(t);
+    return NULL;
 }
 
 void arctok_free(arctok_t *t) {
@@ -271,7 +287,7 @@ int arctok_encode(const arctok_t *t, const char *text, int32_t *ids, int cap) {
             if (f && (size_t)(f - text) < best) { best = (size_t)(f - text); bi = j; }
         }
         if (best > a) k = pretok_bpe(t, text + a, best - a, ids, cap, k);
-        if (bi < 0) break;
+        if (bi < 0 || k < 0) break;
         if (k < cap) ids[k] = t->added_id[bi];
         k++;
         a = best + strlen(t->added[bi]);

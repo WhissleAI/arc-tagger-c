@@ -89,7 +89,13 @@ typedef struct {
     const unsigned char *json;
     size_t position;
 } error;
-static error global_error = { NULL, 0 };
+/* Local change for arc-tagger-c: per thread, so that parsing on different threads does not race. This is the only change to cJSON 1.7.19. */
+#if defined(_MSC_VER)
+#define CJSON_THREAD_LOCAL __declspec(thread)
+#else
+#define CJSON_THREAD_LOCAL __thread
+#endif
+static CJSON_THREAD_LOCAL error global_error = { NULL, 0 };
 
 CJSON_PUBLIC(const char *) cJSON_GetErrorPtr(void)
 {

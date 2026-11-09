@@ -13,22 +13,30 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: ONNX Runtime (prebuilt release)
-        run: ./scripts/download_onnxruntime.sh
-      - name: Build
+      - name: Build (native runtime, no ONNX Runtime)
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j 4
       - name: Smoke (no model)
         run: ./build/arctag_cli --help
-      - name: Model tests (tokenizer + C vs Python parity; need the HF_TOKEN repository secret)
+      - name: Universal macOS build
+        if: runner.os == 'macOS'
+        run: |
+          cmake -S . -B build-universal -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          cmake --build build-universal -j 4
+          lipo -info build-universal/libarctag.a
+      - name: Plain C and no-Accelerate kernels compile
+        run: |
+          cc -std=gnu99 -O2 -Wall -Isrc -DATN_NO_ACCELERATE -c src/atn.c -o /tmp/a.o
+          cc -std=gnu99 -O2 -Wall -Isrc -DATN_NO_ACCELERATE -DATN_SCALAR -c src/atn.c -o /tmp/s.o
+      - name: Model tests (export + parity, stream, threads, corrupt files, fuzz, short soak; need the HF_TOKEN repository secret)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          ARCTAG_THREADS: "2"
         run: |
           if [ -z "$HF_TOKEN" ]; then
             echo "HF_TOKEN secret not set: skipping the model download and the model tests"
             exit 0
           fi
           ./scripts/fetch_model.sh
-          ctest --test-dir build --output-on-failure
+          pip install numpy onnx onnxruntime tokenizers
+          ./scripts/test_native.sh model --quick
