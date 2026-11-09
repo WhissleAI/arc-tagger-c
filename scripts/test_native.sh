@@ -1,7 +1,7 @@
 #!/bin/bash
 # Every native runtime test, one command:
 #
-#   ./scripts/test_native.sh MODEL_DIR            # the full suite (about 10 minutes on a laptop)
+#   ./scripts/test_native.sh MODEL_DIR            # the full suite (about 9 minutes on a busy M3 Pro)
 #   ./scripts/test_native.sh MODEL_DIR --quick    # the same with small fuzz and soak counts
 #
 # MODEL_DIR holds an fp32 arctag.onnx, arctag_meta.json and tokenizer.json (scripts/fetch_model.sh). It is only read. Exports go to

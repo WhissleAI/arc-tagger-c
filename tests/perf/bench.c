@@ -62,6 +62,9 @@ int main(int c, char **v) {
         }
         qsort(ts, 20, sizeof(double), cmpd);
         printf("revise last 3 words + poll at %d: median %.2f ms\n", maxw, ts[10]);
+#ifdef __APPLE__
+        { thread_act_array_t th; mach_msg_type_number_t nth; if (task_threads(mach_task_self(), &th, &nth) == KERN_SUCCESS) printf("threads in process: %u\n", nth); }
+#endif
     }
     arctag_destroy(h);
     return 0;

@@ -24,7 +24,7 @@ export HF_TOKEN=hf_xxx                         # read token with access to the p
 pip install numpy onnx onnxruntime tokenizers  # only to export; the library does not use them
 python3 tools/export_model.py model --weights int8 --out model-int8   # -> arctag.atw, with parity against the ONNX
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-./scripts/test_native.sh model --quick         # every test, in about 2 minutes (see Parity)
+./scripts/test_native.sh model --quick         # every test, in about 4 minutes (see Parity)
 
 ./build/arctag_cli -m model-int8 "Hi, this is Maria Lopez. My number is 555 867 5309."
 ./build/arctag_cli -m model-int8 -d meeting "Priya will send the final numbers by Friday."
@@ -276,7 +276,7 @@ python tests/make_expected.py model        # regenerate tests/expected/*.json
 | Word-by-word and batched streaming vs `arctag_tag_words`, inside the window, plain, timed and with speakers | identical (tolerance 1e-3) |
 | Revisions at depths 1 to 240, undone, vs a stream that never saw them | identical (tolerance 1e-3) |
 
-`./scripts/test_native.sh MODEL_DIR` runs all of these with the tests below. It takes about 10 minutes (`--quick`: about 2).
+`./scripts/test_native.sh MODEL_DIR` runs all of these with the tests below. It took 9 minutes on a busy M3 Pro (`--quick`: 4).
 
 | test | what it does |
 |---|---|
@@ -307,8 +307,8 @@ Measured on an M3 Pro with `tests/perf/bench.c`, one thread, one measurement per
 | Revising the last 3 words, ms | 57-68 (at 400 words) | 1.8-1.9 | 1.6-2.1 | 5.6-7.0 |
 | Load, warm file cache, ms | 243-276 | 7-11 | 12-24 | 7-8 |
 
-Load with the weights out of the file cache (`tests/perf/cold_load.c`; `mincore` confirms 0% resident first): 8.6-9.8 ms for int8, then
-1.8-2.9 ms for the first short text. Loading reads the whole weights file once to check its checksum, through the file cache, not into
+Load with the weights out of the file cache (`tests/perf/cold_load.c`; `mincore` confirms 0% resident first): 8.6-9.8 ms for int8 and 12-16 ms for fp32,
+then 1.8-3.2 ms for the first short text. Loading reads the whole weights file once to check its checksum, through the file cache, not into
 the process. A 250,000-word stream with a revision every 10 words stayed at 10.2 MB dirty and 20.7 MB resident, with cost per word flat
 at about 0.7-0.85 ms.
 
