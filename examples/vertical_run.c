@@ -1,5 +1,5 @@
 /* vertical_run: run one vertical config (configs/NAME.json) over an input and print a compact, vertical-oriented report.
- *   vertical_run CONFIG.json [-m MODEL_DIR] [--int8] [--json] [INPUT|-]
+ *   vertical_run CONFIG.json [-m MODEL_DIR] [--int8] [--backend B] [--json] [INPUT|-]
  * INPUT: plain text, or JSON Lines of words / ASR words ({"w","t0","t1","spk",...} per line, {"endpoint": true} lines).
  * The config's "mode" decides how the input is fed: "batch" = arctag_tag_text / arctag_tag_words over the whole input;
  * "streaming" = utterance by utterance through arctag_push_words + arctag_poll (as a live app would).
@@ -52,16 +52,18 @@ static void report(cJSON *spans, cJSON *events, cJSON *utts, const char *redacte
 
 int main(int argc, char **argv) {
     const char *model = NULL, *config = NULL, *in = "-";
+    const char *backend = NULL;
     int int8 = 0, json = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--int8")) int8 = 1;
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
         else if (!strcmp(argv[i], "--json")) json = 1;
-        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "usage: %s CONFIG.json [-m MODEL_DIR] [--int8] [--json] [INPUT|-]\n", argv[0]); return 2; }
+        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "usage: %s CONFIG.json [-m MODEL_DIR] [--int8] [--backend B] [--json] [INPUT|-]\n", argv[0]); return 2; }
         else if (!config) config = argv[i];
         else in = argv[i];
     }
-    if (!config) { fprintf(stderr, "usage: %s CONFIG.json [-m MODEL_DIR] [--int8] [--json] [INPUT|-]\n", argv[0]); return 2; }
+    if (!config) { fprintf(stderr, "usage: %s CONFIG.json [-m MODEL_DIR] [--int8] [--backend B] [--json] [INPUT|-]\n", argv[0]); return 2; }
     FILE *cf = fopen(config, "rb"); if (!cf) { fprintf(stderr, "cannot open %s\n", config); return 1; }
     char *ctext = slurp(cf); fclose(cf);
     cJSON *cfg = cJSON_Parse(ctext); free(ctext);
@@ -70,6 +72,7 @@ int main(int argc, char **argv) {
     char err[512];
     arctag_t *h = arctag_create_from_config(model, config, err, sizeof err);
     if (!h) { fprintf(stderr, "arctag: %s\n", err); cJSON_Delete(cfg); return 1; }
+    if (backend && arctag_set_option(h, "backend", backend)) { fprintf(stderr, "backend: %s\n", arctag_last_error(h)); arctag_destroy(h); return 1; }
     if (int8 && arctag_set_option(h, "precision", "int8")) { fprintf(stderr, "int8: %s\n", arctag_last_error(h)); return 1; }
     FILE *f = strcmp(in, "-") ? fopen(in, "rb") : stdin;
     if (!f) { fprintf(stderr, "cannot open %s\n", in); return 1; }

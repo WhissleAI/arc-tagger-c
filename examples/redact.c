@@ -1,5 +1,5 @@
 /* redact: PII (and optionally profanity / toxicity) redaction of text, one document per line.
- *   redact [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-d DOMAIN] [--policy POLICY] [--json] [INPUT|-]
+ *   redact [-m MODEL_DIR] [-c CONFIG.json] [--int8] [--backend B] [-d DOMAIN] [--policy POLICY] [--json] [INPUT|-]
  * POLICY: "mask" (default: every PII category except public contacts, plus profanity / toxicity), or a list such as
  * "phone=mask,email=mask,name=mask,card=mask,contact=off" (categories: phone email address card gov_id dob name handle
  * contact profanity toxicity). Prints the redacted line, or with --json {"redacted": ..., "spans": [masked spans]}. */
@@ -19,6 +19,7 @@ static char *read_line(FILE *f) {
 
 int main(int argc, char **argv) {
     const char *model = NULL, *config = NULL, *domain = NULL, *policy = NULL, *in = "-";
+    const char *backend = NULL;
     int int8 = 0, json = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
@@ -26,8 +27,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) domain = argv[++i];
         else if (!strcmp(argv[i], "--policy") && i + 1 < argc) policy = argv[++i];
         else if (!strcmp(argv[i], "--int8")) int8 = 1;
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
         else if (!strcmp(argv[i], "--json")) json = 1;
-        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-d DOMAIN] [--policy P] [--json] [INPUT|-]\n", argv[0]); return 2; }
+        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8] [--backend B] [-d DOMAIN] [--policy P] [--json] [INPUT|-]\n", argv[0]); return 2; }
         else in = argv[i];
     }
     char err[512];
@@ -35,6 +37,7 @@ int main(int argc, char **argv) {
     if (config) h = arctag_create_from_config(model, config, err, sizeof err);
     else { arctag_options o; arctag_options_init(&o); o.precision = int8 ? ARCTAG_INT8 : ARCTAG_FP32; h = arctag_create_ex(model ? model : "model", &o, err, sizeof err); }
     if (!h) { fprintf(stderr, "arctag: %s\n", err); return 1; }
+    if (backend && arctag_set_option(h, "backend", backend)) { fprintf(stderr, "backend: %s\n", arctag_last_error(h)); arctag_destroy(h); return 1; }
     if ((config && int8 && arctag_set_option(h, "precision", "int8")) || (domain && arctag_set_option(h, "domain", domain)) ||
         ((policy || !config) && arctag_set_option(h, "redact", policy ? policy : "mask"))) {
         fprintf(stderr, "option: %s\n", arctag_last_error(h)); arctag_destroy(h); return 1;

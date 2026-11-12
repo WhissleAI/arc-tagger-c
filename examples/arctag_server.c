@@ -1,6 +1,6 @@
 /* arctag_server: a tiny single-threaded JSON server around one arctag handle (one stream).
  *
- *   arctag_server [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-t THREADS] [-d DOMAIN] (--stdin | --port N [--host ADDR])
+ *   arctag_server [-m MODEL_DIR] [-c CONFIG.json] [--int8] [--backend native|onnxruntime] [-t THREADS] [-d DOMAIN] (--stdin | --port N [--host ADDR])
  *   --stdin: JSON lines on stdin -> one JSON line per request on stdout
  *        {"op":"tag","text":"..."}  {"op":"tag_words","words":[...]}  {"op":"push","words":[...],"from":k,"endpoint":true}
  *        {"op":"poll"}  {"op":"reset"}  {"op":"set","key":"domain","value":"meeting"}  {"op":"config","config":{...}}  {"op":"info"}
@@ -166,20 +166,23 @@ static int run_http(arctag_t *h, const char *host, int port) {
     return 0;
 }
 
+static arctag_backend_t backend_arg(const char *v) { return !strcmp(v, "onnxruntime") || !strcmp(v, "ort") ? ARCTAG_BACKEND_ONNXRUNTIME : ARCTAG_BACKEND_NATIVE; }
+
 int main(int argc, char **argv) {
     const char *model = getenv("ARCTAG_MODEL_DIR"), *host = "127.0.0.1", *domain = NULL, *config = NULL, *threads = NULL;
-    int port = 0, use_stdin = 0, precision = -1;
+    int port = 0, use_stdin = 0, precision = -1; const char *backend = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) config = argv[++i];
         else if (!strcmp(argv[i], "--int8")) precision = ARCTAG_INT8;
         else if (!strcmp(argv[i], "--fp32")) precision = ARCTAG_FP32;
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) domain = argv[++i];
         else if (!strcmp(argv[i], "--stdin")) use_stdin = 1;
-        else { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-t THREADS] [-d DOMAIN] (--stdin | --port N [--host ADDR])\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8] [--backend native|onnxruntime] [-t THREADS] [-d DOMAIN] (--stdin | --port N [--host ADDR])\n", argv[0]); return 2; }
     }
     char err[512];
     arctag_t *h;
@@ -187,10 +190,12 @@ int main(int argc, char **argv) {
     else {
         arctag_options o; arctag_options_init(&o);
         if (precision >= 0) o.precision = (arctag_precision_t)precision;
+        if (backend) o.backend = backend_arg(backend);
         h = arctag_create_ex(model ? model : "model", &o, err, sizeof err);
     }
     if (!h) { fprintf(stderr, "arctag_create(%s): %s\n", model ? model : "model", err); return 1; }
     if ((config && precision >= 0 && arctag_set_option(h, "precision", precision == ARCTAG_INT8 ? "int8" : "fp32")) ||
+        (config && backend && arctag_set_option(h, "backend", backend)) ||
         (threads && arctag_set_option(h, "threads", threads)) || (domain && arctag_set_option(h, "domain", domain))) {
         fprintf(stderr, "%s\n", arctag_last_error(h)); arctag_destroy(h); return 1;
     }
