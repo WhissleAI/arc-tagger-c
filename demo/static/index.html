@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arc Tagger demo</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="static/app.css">
+</head>
+<body>
+<header id="top">
+  <div class="row1">
+    <div class="brand"><b>Arc Tagger</b><span class="sub" id="honest">Streaming tagger</span></div>
+    <nav class="tabs" id="tabs"><button data-v="type" class="on" title="chat box: Arc tags the message while you type, before Enter">Type</button><button data-v="live" title="microphone or tab audio -> Deepgram live ASR -> Arc (needs DEEPGRAM_API_KEY on the server)">Live</button></nav>
+    <button id="bDev" class="ghost" title="live JSON event stream and a copyable sample payload">Developer</button>
+  </div>
+  <div class="row2" id="ctl">
+    <label class="fld">Vertical<select id="vertical"></select></label>
+    <span class="det" id="detected" hidden></span>
+    <span class="sep"></span>
+    <label class="fld" title="model graph of the next session">Precision<select id="prec"><option value="fp32" selected>fp32</option><option value="int8">int8</option></select></label>
+    <button id="bTab" title="pick a Chrome tab and tick 'Share tab audio'">Start tab</button>
+    <button id="bMic">Mic</button>
+    <button id="bStop" class="stop" disabled>Stop</button>
+    <span class="note" id="liveNote" hidden></span>
+    <details id="adv"><summary title="ASR and tagger settings">Settings</summary><div class="advbox">
+      <label class="fld">Tier shown<select id="tier"><option value="T0" selected>T0 (at the word)</option><option value="T1">T1 (closed by the next word)</option></select></label>
+      <label class="fld">nova-3 endpointing ms<input type="number" id="endp" value="300" min="0" step="50"></label>
+    </div></details>
+  </div>
+</header>
+
+<div id="conn" class="conn" data-s="connecting"><span id="connTxt">Connecting to the server&hellip;</span><button id="bRetry" class="ghost sm">Retry now</button></div>
+
+<div id="safety">
+  <span class="lbl">Safety</span><span id="scats"></span>
+  <label class="redtg" title="mask PII, profanity and toxicity at T0, then confirm or release at T1/T2"><span>Redaction</span><select id="rmode"><option value="off">off</option><option value="redact">on</option></select></label>
+  <div class="seg dark" id="viewSeg" title="how redacted spans are displayed">
+    <button data-rv="overlay" class="on" title="original words with a category overlay">Overlay</button>
+    <button data-rv="redacted" title="exactly what a downstream consumer receives">Redacted output</button>
+  </div>
+  <label class="redtg" title="blur overlaid words, e.g. while screen-sharing"><input type="checkbox" id="privacy"> Privacy blur</label>
+  <span class="bleepbox" id="bleepBox">
+    <label class="redtg" title="Tab share: silence the shared tab and play it here a little delayed, with every redacted word (current redaction mode and policy) replaced by a 1 kHz bleep. Set before Start tab."><input type="checkbox" id="bleepOn" checked> Bleep tab audio</label>
+    <label class="redtg" title="Monitoring delay: how long the shared tab audio is held back so redacted words can be bleeped. nova-3 usually needs about 2-3 s. Shorter = more words counted as too late">delay <input type="range" id="bleepDelay" min="0.5" max="3" step="0.1" value="1.0"><b id="bleepDelayV">1.0 s</b></label>
+    <span class="bleepct" id="bleepCt"></span>
+    <span class="bleepwarn" id="bleepWarn" hidden></span>
+  </span>
+</div>
+<div id="hiban" class="hiban" hidden><span id="hibanTxt"></span><button id="bHiban" class="ghost sm">Dismiss</button></div>
+<div id="msg" class="msg" role="status"></div>
+
+<main id="live" class="view">
+  <section class="tr-col">
+    <div class="colhead"><h2 id="trTitle">Transcript</h2>
+      <span class="lanetg" id="laneTg" title="read-out lanes under the words: how the pooled utterance read-outs (intent, dialog act), frame states and utterance safety evolve word by word, plus event markers. Hover a lane for the top-3 with p and threshold.">Lanes
+        <label><input type="checkbox" data-lane="intent">Intent</label><label><input type="checkbox" data-lane="act">Act</label><label><input type="checkbox" data-lane="state">State</label><label><input type="checkbox" data-lane="safety">Safety</label><label><input type="checkbox" data-lane="events">Events</label></span>
+      <span class="note" id="trinfo"></span></div>
+    <div class="note laneleg" id="laneLeg"></div>
+    <div id="transcript" class="transcript"><div class="empty big" id="trEmpty">Start <b>Mic</b> or <b>Start tab</b> (live ASR needs <code>DEEPGRAM_API_KEY</code> on the server).</div></div>
+    <button id="bFollow" class="follow" hidden>Jump to live</button>
+    <div class="legend"><span id="legend"></span><label class="dbg"><input type="checkbox" id="dbg"> Debug</label></div>
+  </section>
+  <aside id="panels" class="side"></aside>
+</main>
+
+<section id="type" class="view pad on">
+  <div class="ty-ctl ty-dev">
+    <label class="fld" title="vertical = one of configs/*.json">Setting<select id="tyVert"><option value="voice_assistant" selected>Voice assistant</option><option value="contact_center">Contact center</option><option value="trust_safety_gaming">Trust &amp; safety</option><option value="legal_court">Legal</option><option value="meetings">Meetings</option><option value="sports_media">Sports</option><option value="news_broadcast">News</option><option value="auto">Auto</option></select></label>
+    <label class="fld">Redaction<select id="tyRed"><option value="off" selected>off</option><option value="on">on</option></select></label>
+    <label class="fld" title="model graph: arctag.onnx (fp32) or arctag_int8.onnx (int8)">Precision<select id="tyPrec"><option value="fp32" selected>fp32</option><option value="int8">int8</option></select></label>
+    <button id="tyNew" class="ghost sm" title="end this session and start a new conversation">New chat</button>
+    <span class="note ty-stat" id="tyStat"></span>
+    <label class="ty-rec" title="clean 1920&times;1080 composition for screen recording (also ?video=1)"><input type="checkbox" id="tyVideo"> Recording</label>
+    <details id="tyLongBox" class="ty-long ty-dev"><summary title="paste or load a chat log, transcript or document and stream it into the session">Long text&hellip;</summary>
+        <textarea id="tyLongIn" rows="5" placeholder="Paste several thousand words here. One line = one utterance; a 'Name:' prefix marks the speaker." spellcheck="false"></textarea>
+        <div class="ty-ctl">
+          <input type="file" id="tyLongFile" accept=".txt,text/plain">
+          <button id="tyLongEx" class="ghost sm" title="a synthetic ~2.3k-word support chat log written for this demo">Load example</button>
+          <label class="fld">Speed<select id="tySpeed"><option value="type">40 wpm</option><option value="speech" selected>150 wpm</option><option value="fast">1500 wpm</option></select></label>
+          <button id="tyFeedGo" class="go sm">Stream</button><button id="tyFeedPause" class="sm" disabled>Pause</button><button id="tyFeedStop" class="stop sm" disabled>Stop</button>
+          <span class="note" id="tyLongN"></span> <span class="note" id="tyFeedProg"></span>
+        </div>
+      </details>
+  </div>
+  <div class="ty-vtabs" id="tyVTabs" role="tablist" aria-label="Setting"></div>
+  <div class="ty-try" id="tyTryRow"><div id="tyTry" class="ty-trybtns"></div></div>
+  <div class="ty-grid">
+    <section class="ty-main">
+      <div class="ty-panehead"><h3 id="tyPaneTitle">Conversation</h3><span class="note" id="tyWinInfo"></span><button id="tyFollow" class="ghost sm" hidden>Follow live</button></div>
+      <div class="ty-pane" id="tyPane">
+        <div id="tyThread" class="ty-thread"></div>
+        <div id="tyWin" class="ty-win"></div>
+      </div>
+      <div class="ty-compose">
+        <div id="tyDraft" class="ty-draft"></div>
+        <div class="ty-strip"><div id="tyChips" class="ty-chips"></div><div id="tyMark" class="ty-mark"></div></div>
+        <div class="ty-inrow"><textarea id="tyIn" rows="2" placeholder="Message&hellip;" autocomplete="off" spellcheck="false"></textarea><button id="tySend" class="go">Send</button></div>
+      </div>
+      <section id="tyMon" class="ty-mon">
+        <div class="ty-panehead"><h3>Timeline</h3><span class="note" id="tyMapInfo"></span></div>
+        <div id="tyMap" class="ty-map"></div>
+      </section>
+      <div id="tyLatLine" class="ty-latline"></div>
+      <div id="tyLegend" class="ty-legend"></div>
+    </section>
+    <aside class="ty-side">
+      <div class="ty-panehead"><h3>Tags</h3><span class="ty-focus" id="tyFocus"></span></div>
+      <div id="tyRO" class="ty-ro"></div>
+      <div class="ty-panehead"><h3>Alarm timing</h3><span class="ty-i" id="tyGuardI" tabindex="0">i</span></div>
+      <div id="tyGuardInfo" hidden></div>
+      <div id="tySum" class="ty-sum"></div>
+      <div class="ty-sess ty-dev">
+        <div id="tyAl" class="ty-al"></div>
+        <div id="tyCtx" class="ty-ctx"></div>
+        <div id="tyLat" class="ty-lat"></div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<aside id="dev" class="drawer" hidden>
+  <div class="dhead"><b>Event stream</b><button id="bDevX" class="ghost sm">Close</button></div>
+  <div class="dctl">
+    <label><input type="checkbox" id="jW" checked> words</label><label><input type="checkbox" id="jS" checked> spans</label>
+    <label><input type="checkbox" id="jE" checked> events</label><label><input type="checkbox" id="jT" checked> enrich</label>
+    <label><input type="checkbox" id="jR"> redact</label><label><input type="checkbox" id="jO"> other</label>
+    <label><input type="checkbox" id="jP"> pause</label>
+    <button id="bCopy" class="sm">Copy payload</button><span class="note" id="copyNote"></span>
+  </div>
+  <pre id="json" class="json">waiting for a stream&hellip;</pre>
+</aside>
+
+<details id="foot" class="foot"><summary id="footSum">connecting&hellip;</summary><div class="row3" id="status"></div></details>
+<div id="tip" class="tip"></div>
+<script src="static/app.js"></script>
+<script src="static/type.js"></script>
+</body>
+</html>
