@@ -80,7 +80,7 @@ To fetch them:
 | variable | default | meaning |
 |---|---|---|
 | `HF_REPO` | `WhissleAI/arc-tagger` | repo |
-| `HF_REVISION` | `main` | tag, branch or commit |
+| `HF_REVISION` | `v0.3.0` | tag, branch or commit |
 | `ARCTAG_FETCH` | `all` | `fp32`, `int8` or `all` |
 | `ARCTAG_INT8_URL` | | another location for the int8 graph |
 

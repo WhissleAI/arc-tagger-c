@@ -17,7 +17,7 @@ ctest --test-dir build --output-on-failure
 | variable | default | meaning |
 |---|---|---|
 | `HF_REPO` | `WhissleAI/arc-tagger` | Hugging Face repo |
-| `HF_REVISION` | `main` | tag, branch or commit |
+| `HF_REVISION` | `v0.3.0` | tag, branch or commit |
 | `ARCTAG_FETCH` | `all` | `fp32`, `int8` or `all` |
 | `ARCTAG_INT8_URL` | | where to get `arctag_int8.onnx` if the HF repo does not have it |
 

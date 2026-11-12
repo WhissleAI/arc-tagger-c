@@ -3,14 +3,14 @@
 #   HF_TOKEN=hf_... scripts/fetch_model.sh [DEST_DIR]
 # Env:
 #   HF_REPO        default WhissleAI/arc-tagger
-#   HF_REVISION    default main (a tag, branch or commit of the model repo; pin it to the v0.3.0 upload for reproducible tests)
+#   HF_REVISION    default v0.3.0 (a tag, branch or commit of the model repo)
 #   ARCTAG_FETCH   fp32 | int8 | all (default all): which ONNX graphs to fetch
 #   ARCTAG_INT8_URL  optional URL of arctag_int8.onnx when it is not in the HF repo (e.g. a GitHub release asset;
 #                    a GitHub URL is fetched with $GITHUB_TOKEN when set)
 # The int8 graph is optional: if it can be found nowhere, the script says so and the fp32 files are still installed.
 set -euo pipefail
 REPO="${HF_REPO:-WhissleAI/arc-tagger}"
-REV="${HF_REVISION:-main}"
+REV="${HF_REVISION:-v0.3.0}"
 WHICH="${ARCTAG_FETCH:-all}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-$ROOT/model}"
