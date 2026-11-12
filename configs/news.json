@@ -1,0 +1,25 @@
+{
+  "name": "news",
+  "use_case": "News broadcast",
+  "description": "Broadcast news: people, organisations, places, events, dates and numbers, story starts, broadcast mode and subject, reporter / anchor roles.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 2,
+  "mode": "batch",
+  "max_ctx": 2048,
+  "domain": "news",
+  "asr": "unknown",
+  "emit": [
+    "entity",
+    "number",
+    "profanity",
+    "toxicity",
+    "events",
+    "intent",
+    "role",
+    "state"
+  ],
+  "tags": [],
+  "thresholds": {},
+  "redact": "off"
+}

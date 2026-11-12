@@ -1,0 +1,27 @@
+{
+  "name": "edge_low_latency",
+  "use_case": "Low-latency edge (int8, one thread)",
+  "description": "Embedded / edge deployment: the int8 graph on one ONNX Runtime thread with a short streaming window. Entities, numbers, PII, intents and safety flags.",
+  "model_dir": "../model",
+  "precision": "int8",
+  "threads": 1,
+  "mode": "streaming",
+  "stream_ctx": 96,
+  "domain": "auto",
+  "asr": "unknown",
+  "emit": [
+    "entity",
+    "number",
+    "pii",
+    "profanity",
+    "toxicity",
+    "events",
+    "intent",
+    "act",
+    "safety"
+  ],
+  "tags": [],
+  "thresholds": {},
+  "redact": "off",
+  "_notes": "stream_ctx 96 = the span window: each poll re-runs 96 words. See docs/int8.md for the int8 accuracy / latency trade-off."
+}
