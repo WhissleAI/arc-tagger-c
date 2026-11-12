@@ -485,6 +485,10 @@ static int open_ort(arctag_t *h) {
     ORT_CHECK(h, h->ort->SetIntraOpNumThreads(so, h->threads));
     ORT_CHECK(h, h->ort->SetInterOpNumThreads(so, 1));
     ORT_CHECK(h, h->ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
+    /* A model stored with int8 weight tables (tools/quantize_model.py) has DequantizeLinear nodes on constant inputs. By
+     * default ONNX Runtime keeps them for its quantised-graph passes and runs them on every call; with those passes off
+     * they fold into float tables once, at load. */
+    ORT_CHECK(h, h->ort->AddSessionConfigEntry(so, "session.disable_quant_qdq", "1"));
 #ifdef _WIN32
     {
         int n = MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, NULL, 0);
