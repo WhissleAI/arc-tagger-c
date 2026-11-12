@@ -19,16 +19,17 @@ text-only streaming tagger with about 10 M parameters. Give it words from any AS
   - item / topic;
   - content state: mode, phase, game state.
 
-It runs on CPU with ONNX Runtime. Two graphs ship: `arctag.onnx` (fp32, 34 MB) and `arctag_int8.onnx` (int8, 11.5 MB),
-and you choose one at load time. Decoding follows the T0 (zero-lag) path of the Arc Tagger v0.3.0 Python package. The
-output matches the package's tags and on/off decisions, and matches this repo's Python reference bit for bit (see
-[Parity](#parity)).
+It runs on CPU with one of two backends: a **native** backend in plain C (the default: no dependencies, loads in about
+60 ms, streams at about 2.5 ms per word) or **ONNX Runtime**. Both read the same model files: `arctag.onnx` (fp32, 34 MB)
+and `arctag_int8.onnx` (int8, 11.5 MB), and you choose one at load time. Decoding follows the T0 (zero-lag) path of the
+Arc Tagger v0.3.0 Python package. The output matches the package's tags and on/off decisions; with ONNX Runtime it
+matches this repo's Python reference bit for bit, and the native backend makes the same decisions (see [Parity](#parity)).
 
 ## Quickstart
 
 ```bash
 git clone git@github.com:WhissleAI/arc-tagger-c.git && cd arc-tagger-c
-./scripts/download_onnxruntime.sh              # prebuilt ONNX Runtime 1.20.1 -> third_party/onnxruntime
+./scripts/download_onnxruntime.sh              # prebuilt ONNX Runtime 1.20.1 -> third_party/onnxruntime (optional, see Backends)
 export HF_TOKEN=hf_xxx                         # read token with access to the private model repo
 ./scripts/fetch_model.sh                       # -> ./model (arctag.onnx, arctag_int8.onnx, arctag_meta.json, tokenizer.json)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
@@ -36,6 +37,7 @@ ctest --test-dir build --output-on-failure
 
 ./build/arctag_cli "Hi, this is Maria Lopez. My number is 555 867 5309."
 ./build/arctag_cli --int8 -d meeting "Priya will send the final numbers by Friday."
+./build/arctag_cli --backend onnxruntime "Same text, run by ONNX Runtime."
 ./build/arctag_cli --redact mask "Email me at jo@example.com or call 415 555 0199."
 ./build/vertical_run configs/contact_center.json examples/data/call_center.txt
 ./build/stream_asr -c configs/voice_assistant.json examples/data/asr_stream.jsonl
@@ -123,14 +125,15 @@ arctag_destroy(h);
 | `arctag_tag_text(h, text)` | tag a whole text (whitespace words; `. ? !` ends an utterance) |
 | `arctag_tag_words(h, words_json)` | the same for pre-split words (`"eou": true` on a word ends an utterance) |
 | `arctag_push_words(h, json)` | streaming input: append, revise from index `from`, `endpoint` |
-| `arctag_poll(h)` | run the model on the newest `stream_ctx` words and return the update |
+| `arctag_poll(h)` | bring the model up to date with the stream (at most the newest `stream_ctx` words) and return the update |
 | `arctag_reset(h)`, `arctag_info(h)`, `arctag_last_error(h)` | forget the stream; describe the handle; last error |
 | `arctag_free_str(s)`, `arctag_destroy(h)`, `arctag_version()` | |
 
 Every returned string is malloc'd JSON, which you release with `arctag_free_str`. A handle is not thread-safe, so use
-one per stream or thread. Each handle holds its own ONNX Runtime session: about 110 MB peak RSS with fp32 and about
-75 MB with int8 for typical inputs. A full 2048-word pass peaks near 1 GB because memory grows faster than linearly with
-the window, so lower `max_ctx` to reduce that.
+one per stream or thread. Each handle holds its own copy of the model: with the native backend about 72 MB peak RSS with
+fp32 and 26 MB with weight-only int8; with ONNX Runtime about 115 MB with fp32 and 76 MB with dynamic int8 (see
+[Backends](#backends)). Under ONNX Runtime a full 2048-word pass peaks near 1 GB, because memory grows faster than
+linearly with the window, so lower `max_ctx` to reduce that.
 
 **Options** (`arctag_set_option`, or the same keys in a config):
 
@@ -138,8 +141,9 @@ the window, so lower `max_ctx` to reduce that.
 |---|---|---|
 | `domain` | `auto`, `talk`, `meeting`, `court`, `assistant`, `sports`, `news`; a fine domain (`nba` `nhl` `nfl` `soccer` `cricket` `court_appellate` `court_trial` `assistant_noisy` `stream_chat`); or `ui:fine` | `auto` |
 | `asr` | where the words come from: `unknown`, `human` (human-written text; `gold` is accepted as an alias), `stock_rnnt`, `arc_transcriber`, `nemotron35`, `deepgram`, `final_only`, `web` | `unknown` |
-| `precision` | `fp32` / `int8` (reloads the session) | `fp32` |
-| `threads` | ONNX Runtime intra-op threads (reloads the session) | `$ARCTAG_THREADS` or 0 |
+| `backend` | `native` / `onnxruntime` (reloads the model) | `native` (or `$ARCTAG_BACKEND`) |
+| `precision` | `fp32` / `int8` (reloads the model) | `fp32` |
+| `threads` | ONNX Runtime intra-op threads (reloads the session); the native backend uses one thread | `$ARCTAG_THREADS` or 0 |
 | `fine_auto` | `on` / `off`: inside `sports` and `court`, pick the fine domain from lexicon cues the way the package does | `on` |
 | `emit` | output sections: `entity number pii profanity toxicity events intent act safety emotion arousal valence intensity role item state` | all |
 | `tags` | tag prefixes to keep | all |
@@ -147,7 +151,8 @@ the window, so lower `max_ctx` to reduce that.
 | `thr:PATTERN` | threshold override: a tag, `prefix*`, `...@readout`, or `head:FAMILY`; `""` removes it | |
 | `thr_reset` | drops all overrides | |
 | `max_ctx` | words per model pass in `tag_text` / `tag_words`; longer texts are cut into independent chunks | 2048 |
-| `stream_ctx` | words of context re-run by each `arctag_poll` | 256 |
+| `stream_ctx` | words of context the stream keeps (ONNX Runtime re-runs them on each `arctag_poll`) | 256 |
+| `stream_state` | native: `on` carries the state from poll to poll; `off` re-runs the `stream_ctx` window like ONNX Runtime (same output, slower) | `on` |
 
 The domain is a model input: it sets which tags are valid and selects the thresholds. `auto` runs the model's
 `unknown` domain, where every tag is valid, so sports events or items can fire on unrelated text. Set the domain when
@@ -196,29 +201,67 @@ poll's spans. [docs/USAGE.md](docs/USAGE.md#output-json) has every field.
 
 `arctag_meta.json` (`readouts`) lists every column.
 
+## Backends
+
+| | native (default) | ONNX Runtime |
+|---|---|---|
+| dependencies | none (libc, libm) | ONNX Runtime 1.20.1 (`scripts/download_onnxruntime.sh`) |
+| streaming | each poll computes only the words added or revised since the last poll | each poll re-runs the last `stream_ctx` words |
+| threads | one per handle | `threads` intra-op threads |
+| output | same decisions as the Python reference; scores within 3e-4 | bit-equal to the Python reference |
+
+Choose one with any of:
+
+- `arctag_options.backend = ARCTAG_BACKEND_NATIVE` / `ARCTAG_BACKEND_ONNXRUNTIME` for `arctag_create_ex`;
+- `arctag_set_option(h, "backend", "native" | "onnxruntime")` (reloads the model) or `"backend"` in a config;
+- `--backend native|onnxruntime` in the CLI tools, the examples and the server;
+- `ARCTAG_BACKEND=onnxruntime` in the environment (used when the options leave the backend at its default).
+
+`-DARCTAG_WITH_ORT=OFF` builds the library, tools and tests without ONNX Runtime (native only).
+
+Measured with `bench` (`examples/data/*.txt`, 600 streamed words each pushed on its own and polled, `stream_ctx` 256;
+batch = `tag_text` per line, 2 passes) on a shared 24-core Threadripper 2970WX under load (load average about 12), nice 19.
+Streaming p50 / p95 ms per word; batch ms per word; 1 thread / 4 threads.
+
+| backend, model file | file | load | streaming, 1 thread | streaming, 4 threads | batch, 1 / 4 threads | peak RSS |
+|---|---|---|---|---|---|---|
+| ONNX Runtime, fp32 | 34.0 MB | 479 ms | 122 / 191 | 99 / 108 | 0.50 / 0.34 | 118 MB |
+| ONNX Runtime, int8 (dynamic) | 11.5 MB | 404 ms | 121 / 127 | 94 / 100 | 0.38 / 0.36 | 76 MB |
+| ONNX Runtime, int8 (weight-only) | 9.4 MB | 510 ms | 173 / 192 | 99 / 108 | 0.53 / 0.37 | 117 MB |
+| **native, fp32** | 34.0 MB | **70 ms** | **2.6 / 2.8** | 2.5 / 2.6 | 0.59 / 0.59 | 72 MB |
+| native, int8 (dynamic) | 11.5 MB | 57 ms | 2.5 / 2.7 | 2.6 / 2.9 | 0.61 / 0.59 | 51 MB |
+| **native, int8 (weight-only)** | **9.4 MB** | **40 ms** | **1.2 / 1.3** | 1.2 / 1.4 | 0.53 / 0.51 | **26 MB** |
+
+The native backend streams about 50x faster, because a poll costs one word instead of `stream_ctx` words; it also loads
+about 7x faster and uses less memory. For one-shot `tag_text` the two are close; ONNX Runtime is faster there with 4 threads.
+The weight-only int8 file (made with `tools/quantize_model.py`) is the fastest and smallest under the native backend; see
+[Precision](#precision-fp32-and-int8).
+
 ## Precision: fp32 and int8
 
-| | fp32 (`arctag.onnx`) | int8 (`arctag_int8.onnx`) |
+Two int8 files work with both backends:
+
+- **weight-only int8** (`python tools/quantize_model.py model/arctag.onnx model/arctag_int8.onnx`): int8 weight tables,
+  float compute. 9.4 MB. Streaming equals the offline pass exactly. **Recommended**, especially with the native backend
+  (26 MB RSS, about 2x faster streaming than fp32).
+- **dynamic int8** (the `arctag_int8.onnx` the model repo ships today): activations are quantised per call under ONNX
+  Runtime. 11.5 MB. The native backend converts it to float tables at load.
+
+Agreement of the int8 files with fp32 (`int8_agreement`, the 120 parity cases):
+
+| | span F1 vs fp32 | max \|p diff\| |
 |---|---|---|
-| file | 34.0 MB | 11.5 MB |
-| load | 557 ms | 446 ms |
-| peak RSS | 110 MB | 76 MB |
-| streaming ms/word p50 / p95, 1 thread (`stream_ctx` 256) | 138 / 168 | 137 / 175 |
-| streaming ms/word p50 / p95, 4 threads | 116 / 151 | 109 / 127 |
-| streaming ms/word p50 / p95, 1 thread, `stream_ctx` 96 | 40 / 54 | 38 / 53 |
-| batch ms/word, 1 / 4 threads | 0.45 / 0.49 | 0.41 / 0.42 |
-| span agreement with fp32 (Whissle internal held-out test set, 25k spans) | | F1 0.962 (toxicity 0.864, PII 0.935, numbers 0.972) |
-| events / intent / safety agreement | | F1 0.960 / 0.981 / 0.970 |
-| span F1, Whissle internal held-out test set (all / names / numbers / PII) | 0.468 / 0.452 / 0.525 / 0.362 | 0.465 / 0.451 / 0.515 / 0.370 |
-| intent accuracy, Whissle internal held-out test set | 0.569 | 0.562 |
+| weight-only int8, either backend | 0.989 | 0.058 |
+| dynamic int8, native | 0.988 | 0.100 |
+| dynamic int8, ONNX Runtime | 0.980 | 0.139 |
 
-Timings come from `bench` on a shared, loaded 24-core Threadripper, so compare the ratios. int8 is smaller and lighter
-but not faster, because most of the compute is in fp32 activation products. Against fp32, toxicity spans move the
-most. On the test set's labels, numbers drop the most (-1 pt).
+On the Whissle internal held-out test set the dynamic int8 file under ONNX Runtime agrees with fp32 on 96% of spans
+(toxicity 86%, PII 94%, numbers 97%) and on 96-98% of events, intents and safety read-outs; span F1 against the test
+labels is within 0.3 pt of fp32 (0.465 vs 0.468) and intent accuracy within 0.7 pt.
 
-Use int8 for edge devices and many handles per process, and fp32 when you need the reference output. int8 streaming
-scores depend slightly on the window, because activations are quantised per call. [docs/int8.md](docs/int8.md) covers
-the quantisation settings and per-output agreement.
+Use int8 for edge devices and many handles per process, and fp32 when you need the reference output. Under ONNX
+Runtime, dynamic int8 streaming scores depend slightly on the window, because activations are quantised per call; the
+weight-only file and the native backend do not have this effect. [docs/int8.md](docs/int8.md) has the details.
 
 ## Configs and verticals
 
@@ -281,12 +324,22 @@ through `ctypes`. [demo/README.md](demo/README.md) covers the flags, the tabs an
 | C library vs Python reference, fp32, 120 cases (8 with configs: emit, tags, redaction, overrides) | 600 spans, all fields identical, scores bit-equal |
 | C library vs Python reference, int8 | 596 spans, all fields identical, scores bit-equal |
 | C streaming (push per utterance + poll) vs `arctag_tag_text`, fp32 | identical within 1e-4 |
+| native backend vs Python reference, fp32, 120 cases | 600 spans, every tag, range and on/off decision identical; 4 scores differ by more than 1e-4 (max 2.6e-4) |
+| native streaming vs native `arctag_tag_text`, fp32 and int8 | identical (scores bit-equal) |
+| native backend vs ONNX Runtime, `tag_text` on `examples/data` | max score difference 1.5e-4 |
+
+The native backend's scores sit closer to exact arithmetic than ONNX Runtime's: against a float64 evaluation of the same
+model files the native backend differs by at most 6e-6, ONNX Runtime fp32 by up to 1.4e-4 (its float32 sigmoid and
+reductions). The 1e-4 checks therefore apply to ONNX Runtime, and the native backend is checked at 5e-4 with identical
+decisions.
 
 `ctest` covers:
 
 - tokenizer;
-- `parity_fp32`, `parity_int8`;
-- `int8_agreement` (F1 >= 0.90, max |dp| <= 0.25);
+- `parity_fp32`, `parity_int8` (ONNX Runtime), `parity_native_fp32`, `native_int8_stream`;
+- `int8_agreement`, `int8_agreement_ort` (F1 >= 0.90, max |dp| <= 0.25);
+- `native_stream` (streaming with revisions and speaker changes equals a fresh pass, long sessions, both backends agree,
+  truncated / corrupted model files are refused);
 - `config` (all `configs/*.json`, option errors, filters, redaction, overrides);
 - example smoke tests;
 - `demo_smoke` (the web demo, word by word, when Python 3 and `websockets` are installed).
@@ -297,7 +350,7 @@ checking.
 
 ## How it works
 
-`text -> words -> utterances -> per-word input features -> ONNX graph -> per-word / per-utterance probabilities -> decode`
+`text -> words -> utterances -> per-word input features -> model (native or ONNX Runtime) -> per-word / per-utterance probabilities -> decode`
 
 - **Inputs** (`src/arctag.c`), per word:
   - up to 8 BPE pieces (`" " + word`: the first 7 and the last);
@@ -325,8 +378,8 @@ checking.
 ## Limits
 
 - `tag_text` is offline over at most `max_ctx` (2048) words per pass. Longer texts are split into independent chunks.
-- `arctag_poll` re-runs the whole `stream_ctx` window every time and carries no state forward. Poll per ASR update
-  rather than per word, or lower `stream_ctx`.
+- Under ONNX Runtime, `arctag_poll` re-runs the whole `stream_ctx` window every time. Poll per ASR update rather than
+  per word, or lower `stream_ctx`, or use the native backend, which carries its state from poll to poll.
 - Not included:
   - the session-KB pointer (custom name lists);
   - the T1 / T2 delayed tiers;
@@ -337,12 +390,14 @@ checking.
 
 ```
 include/arctag.h        public API
-src/arctag.c            features, ONNX Runtime session, decoding, configs, redaction, JSON
+src/arctag.c            features, backends, decoding, configs, redaction, JSON
+src/native.c            native backend (plain C; AVX2 / NEON kernels where available)
+src/onnx_file.c         reads the model tables from the .onnx files for the native backend
 src/tokenizer.c         byte-level BPE reading tokenizer.json (+ src/unicode_tables.h from tools/gen_unicode.py)
 configs/                vertical configs (JSON)
 demo/                   web demo: server.py (asyncio + ctypes), arctag_ffi.py (ctypes binding), static/ (page)
 examples/               arctag_cli, arctag_server, batch_tag, stream_asr, redact, vertical_run, compare_precision, bench; data/
-tests/                  test_tokenizer, test_parity, test_config, test_int8_agreement, demo_smoke.py, expected/ (made-up texts), make_expected.py
+tests/                  test_tokenizer, test_parity, test_config, test_int8_agreement, test_native, demo_smoke.py, expected/ (made-up texts), make_expected.py
 python/arctag_ref.py    Python reference (numpy + onnxruntime + tokenizers)
 docs/                   USAGE.md, int8.md
 scripts/                download_onnxruntime.sh/.ps1, fetch_model.sh

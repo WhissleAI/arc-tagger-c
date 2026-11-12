@@ -8,6 +8,8 @@ int8 variant is covered in [int8.md](int8.md).
 ```sh
 ./scripts/download_onnxruntime.sh                  # prebuilt ONNX Runtime 1.20.1 -> third_party/onnxruntime
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+# or, native backend only (no ONNX Runtime needed):
+# cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DARCTAG_WITH_ORT=OFF && cmake --build build -j
 HF_TOKEN=hf_... ./scripts/fetch_model.sh           # -> model/ (arctag.onnx, arctag_int8.onnx, arctag_meta.json, tokenizer.json)
 ctest --test-dir build --output-on-failure
 ```
@@ -30,9 +32,36 @@ A model directory holds:
 - `arctag_meta.json` (ontology read-outs, per-domain thresholds, decoding constants);
 - `tokenizer.json`.
 
+## Backends
+
+Two backends run the model from the same files:
+
+- `native` (default): plain C, one thread per handle. Streaming polls compute only the words added or revised since the
+  last poll, so a per-word poll costs about 1-3 ms. Loads in 40-70 ms.
+- `onnxruntime`: ONNX Runtime 1.20.1, `threads` intra-op threads. Bit-equal to the Python reference. Each poll re-runs
+  the last `stream_ctx` words (about 100 ms per poll at 256).
+
+Both make the same decisions; scores differ by at most a few 1e-4. Choose one with:
+
+| where | how |
+|---|---|
+| C, at load | `arctag_options o; arctag_options_init(&o); o.backend = ARCTAG_BACKEND_ONNXRUNTIME;` then `arctag_create_ex` |
+| C, later | `arctag_set_option(h, "backend", "onnxruntime")` (reloads the model; the stream is kept) |
+| config | `"backend": "native"` or `"onnxruntime"` |
+| tools and server | `--backend native` / `--backend onnxruntime` |
+| environment | `ARCTAG_BACKEND=onnxruntime`, used when the options leave the backend at its default |
+
+`arctag_info` reports `backend`, `weights` (`fp32`, `int8`, or `int8-folded` when the native backend converted a
+dynamically quantised file to float at load) and, for the native backend, `kernels` (`avx2`, `neon` or `scalar`) and
+`stream_state`.
+
+The native backend checks the model file when it loads it (every table's shape and every index range) and refuses a
+truncated or corrupted file with a message, without crashing. AVX2 kernels are used only when the CPU has them.
+
 ## Command-line tools
 
-All tools take `-m MODEL_DIR` (default `$ARCTAG_MODEL_DIR` or `model`), `-c CONFIG.json`, and `--int8` / `--fp32`.
+All tools take `-m MODEL_DIR` (default `$ARCTAG_MODEL_DIR` or `model`), `-c CONFIG.json`, `--int8` / `--fp32` and
+`--backend native|onnxruntime`.
 Options given on the command line are applied after the config.
 
 | tool | what it does | example |
@@ -44,7 +73,7 @@ Options given on the command line are applied after the config.
 | `redact` | PII / profanity redaction, line by line | `redact --policy phone=mask,email=mask,name=mask examples/data/pii.txt` |
 | `vertical_run` | runs one vertical config over an input and prints a report | `vertical_run configs/legal.json examples/data/court.txt` |
 | `compare_precision` | fp32 and int8 side by side: load time, ms/word, items that differ | `compare_precision examples/data/docs.txt` |
-| `bench` | load time, streaming per-word latency p50 / p95, batch ms/word, peak RSS | `bench --int8 -t 1 examples/data/*.txt` |
+| `bench` | load time, streaming per-word latency p50 / p95, batch ms/word, peak RSS (`--model-file F` for another .onnx, `--stream-state on\|off`) | `bench --backend native --int8 -t 1 examples/data/*.txt` |
 | `arctag_server` | JSON over stdin/stdout or HTTP, one stream per server | `arctag_server -c configs/voice_assistant.json --port 8080` |
 
 `arctag_cli` flags:
@@ -74,7 +103,7 @@ With `--stdin` the server reads one JSON request per line (`{"op": "tag" | "tag_
 
 ```c
 arctag_options o; arctag_options_init(&o);
-o.precision = ARCTAG_INT8; o.threads = 1;                       /* or leave the defaults: fp32, ORT threads */
+o.precision = ARCTAG_INT8;                                      /* or leave the defaults: fp32, native backend */
 arctag_t *h = arctag_create_ex("model", &o, err, sizeof err);    /* or arctag_create_from_config("model", "configs/legal.json", ...) */
 arctag_set_option(h, "domain", "meeting");
 char *json = arctag_tag_text(h, "Dana will send the notes by Friday.");
@@ -90,7 +119,7 @@ char *p = arctag_poll(h);   /* spans with end > a0 replace yours; new events; ut
 ```
 
 A handle is not thread-safe. Use one handle per stream or thread. Handles share nothing, so for N streams load N handles.
-With int8 each one costs about 30 MB less.
+A native handle with the weight-only int8 file costs about 26 MB, with fp32 about 72 MB.
 
 ## Configs
 
@@ -101,13 +130,15 @@ with `_`, and `name`, `use_case`, `description`, `vertical`, `notes`, are ignore
 | key | value |
 |---|---|
 | `model_dir` | model directory relative to the config file (used when `model_dir` is NULL) |
+| `backend` | `"native"` (default) / `"onnxruntime"` |
 | `precision` | `"fp32"` / `"int8"` |
-| `threads` | ONNX Runtime intra-op threads (0 = ORT default) |
+| `threads` | ONNX Runtime intra-op threads (0 = ORT default); the native backend uses one thread |
 | `mode` | `"batch"` / `"streaming"`: informational for the library, read by `vertical_run` to pick the API |
 | `domain` | a profile (`auto talk meeting court assistant sports news`), a fine domain (`nba nhl nfl soccer cricket court_appellate court_trial assistant_noisy stream_chat`) or `"ui:fine"` |
 | `asr` | where the words come from (`unknown human stock_rnnt arc_transcriber nemotron35 deepgram final_only web`) |
 | `fine_auto` | `true` (default): inside `sports` / `court`, switch the fine domain from lexicon cues the way the Python package does |
-| `max_ctx`, `stream_ctx` | words per model pass for `tag_text` (2048), and words re-run per poll (256) |
+| `max_ctx`, `stream_ctx` | words per model pass for `tag_text` (2048), and words of context the stream keeps (256; ONNX Runtime re-runs them per poll) |
+| `stream_state` | native backend: `true` (default) carries the state from poll to poll; `false` re-runs the window on every poll (same output, slower) |
 | `emit` | output sections to keep: `entity number pii profanity toxicity events intent act safety emotion arousal valence intensity role item state` (`[]` = all) |
 | `tags` | tag prefixes to keep (`[]` = all) |
 | `thresholds` | `{PATTERN: value}` overrides, applied on top of the domain's thresholds (see below); replaces earlier overrides |
@@ -224,8 +255,10 @@ sections and entries from the output. They never change what is computed.
 - **Speaker ids** (`"spk"` on words) enable speaker-change features and speaker roles.
 - **ASR source.** Set `asr` to the recogniser that produced the words when it is one of the listed sources. The model
   learnt each one's punctuation and casing habits.
-- **Streaming cost.** Each poll re-runs the last `stream_ctx` words. A smaller value lowers the per-word cost and
-  shortens the context; `edge_low_latency.json` uses 96. Polling every N words instead of every word also helps.
+- **Streaming cost.** With the native backend a poll costs about one word's compute (more after a revision of earlier
+  words), so per-word polling is fine. Under ONNX Runtime each poll re-runs the last `stream_ctx` words: a smaller value
+  lowers the per-word cost and shortens the context (`edge_low_latency.json` uses 96), and polling every N words instead
+  of every word also helps.
 
 ## Upgrading from library 0.1.0
 

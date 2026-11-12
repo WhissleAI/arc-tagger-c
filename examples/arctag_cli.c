@@ -1,5 +1,5 @@
 /* arctag_cli: tag a text (argument or stdin) and print the JSON result.
- *   arctag_cli [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-d DOMAIN] [-a ASR] [-t THREADS] [--redact POLICY] [--emit LIST]
+ *   arctag_cli [-m MODEL_DIR] [-c CONFIG.json] [--int8] [--backend native|onnxruntime] [-d DOMAIN] [-a ASR] [-t THREADS] [--redact POLICY] [--emit LIST]
  *              [--tags PREFIXES] [--thr PATTERN=VALUE]... [--words] [--stream] [--info] "text ..."
  *   echo "text" | arctag_cli -m model
  * --words reads a JSON word array (strings or {"w","t0","t1","conf","spk","eou"}) instead of plain text.
@@ -31,8 +31,10 @@ static void json_escape(const char *s, char *out, size_t cap) {
     out[k] = 0;
 }
 
+static arctag_backend_t backend_arg(const char *v) { return !strcmp(v, "onnxruntime") || !strcmp(v, "ort") ? ARCTAG_BACKEND_ONNXRUNTIME : ARCTAG_BACKEND_NATIVE; }
+
 static void usage(const char *p) {
-    printf("usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8|--fp32] [-d DOMAIN] [-a ASR] [-t THREADS]\n"
+    printf("usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8|--fp32] [--backend native|onnxruntime] [-d DOMAIN] [-a ASR] [-t THREADS]\n"
            "          [--redact off|mask|cat=mask,...] [--emit SECTIONS] [--tags PREFIXES] [--thr PATTERN=VALUE]...\n"
            "          [--words] [--stream] [--info] [TEXT]\n(arctag %s)\n", p, arctag_version());
 }
@@ -40,7 +42,7 @@ static void usage(const char *p) {
 int main(int argc, char **argv) {
     const char *model = getenv("ARCTAG_MODEL_DIR"), *config = NULL;
     const char *keys[64], *vals[64]; int nkv = 0;
-    int stream = 0, info = 0, words = 0, precision = -1; char *text = NULL;
+    int stream = 0, info = 0, words = 0, precision = -1; char *text = NULL; const char *backend = NULL;
     static char thrkey[64][300];
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -48,6 +50,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-c") && i + 1 < argc) config = argv[++i];
         else if (!strcmp(a, "--int8")) precision = ARCTAG_INT8;
         else if (!strcmp(a, "--fp32")) precision = ARCTAG_FP32;
+        else if (!strcmp(a, "--backend") && i + 1 < argc) backend = argv[++i];
         else if (!strcmp(a, "-d") && i + 1 < argc && nkv < 64) { keys[nkv] = "domain"; vals[nkv++] = argv[++i]; }
         else if (!strcmp(a, "-a") && i + 1 < argc && nkv < 64) { keys[nkv] = "asr"; vals[nkv++] = argv[++i]; }
         else if (!strcmp(a, "-t") && i + 1 < argc && nkv < 64) { keys[nkv] = "threads"; vals[nkv++] = argv[++i]; }
@@ -73,9 +76,11 @@ int main(int argc, char **argv) {
         if (h && precision >= 0 && arctag_set_option(h, "precision", precision == ARCTAG_INT8 ? "int8" : "fp32")) {
             fprintf(stderr, "precision: %s\n", arctag_last_error(h)); arctag_destroy(h); return 1;
         }
+        if (h && backend && arctag_set_option(h, "backend", backend)) { fprintf(stderr, "backend: %s\n", arctag_last_error(h)); arctag_destroy(h); return 1; }
     } else {
         arctag_options o; arctag_options_init(&o);
         if (precision >= 0) o.precision = (arctag_precision_t)precision;
+        if (backend) o.backend = backend_arg(backend);
         h = arctag_create_ex(model ? model : "model", &o, err, sizeof err);
     }
     if (!h) { fprintf(stderr, "arctag_create(%s): %s\n", model ? model : "model", err); return 1; }

@@ -1,27 +1,44 @@
 # int8 vs fp32
 
-`arctag_int8.onnx` is a dynamically quantised copy of `arctag.onnx`. Both graphs use the same decoder, thresholds and
-JSON output. You choose one at load time, and switching later reloads the session:
+Two int8 forms of `arctag.onnx` work with the library, under both backends:
+
+| | weight-only int8 | dynamic int8 |
+|---|---|---|
+| made with | `python tools/quantize_model.py model/arctag.onnx model/arctag_int8.onnx` | ONNX Runtime `quantize_dynamic` (the `arctag_int8.onnx` the model repo ships today) |
+| file | 9.4 MB | 11.5 MB |
+| what is int8 | the weight tables (one scale per column); compute is float | the weights, and under ONNX Runtime the activations, quantised per call |
+| streaming vs offline | identical, both backends | identical on the native backend; differs slightly under ONNX Runtime |
+| agreement with fp32 (`int8_agreement`, span F1 / max \|dp\|) | 0.989 / 0.058, both backends | native 0.988 / 0.100; ONNX Runtime 0.980 / 0.139 |
+| native backend | kept int8 in memory: 26 MB RSS, streaming about 2x faster than fp32 | converted to float tables at load: 51 MB RSS, fp32 speed |
+| ONNX Runtime | folded to float tables at load (fp32 speed and memory) | int8 kernels: 76 MB RSS |
+
+**Recommendation: weight-only int8.** It is the smallest file, it streams exactly like the offline pass, it agrees best
+with fp32, and with the native backend (the default) it is the fastest and lightest configuration: 40 ms load, 1.2 ms per
+streamed word, 26 MB per handle. Keep the dynamic file only if you run ONNX Runtime and need its lower memory there.
+
+Both are loaded as "int8" (`arctag_int8.onnx` in the model directory), or by name with `model_file`. You choose at load
+time, and switching later reloads the model:
 
 ```c
 arctag_options o; arctag_options_init(&o); o.precision = ARCTAG_INT8;     /* C API */
 arctag_create_ex("model", &o, err, sizeof err);
-arctag_set_option(h, "precision", "int8");                               /* or later: reloads the session */
+arctag_set_option(h, "precision", "int8");                               /* or later: reloads the model */
+o.model_file = "arctag_w8.onnx";                                         /* or any other file in the model directory */
 ```
 
 You can also choose it with:
 
 - `"precision": "int8"` in a config;
-- `--int8` in the CLI tools and the server;
+- `--int8` in the CLI tools and the server (`bench --model-file F` for any file);
 - `ARCTAG_PRECISION=int8` for `arctag_create`.
 
-**Summary.** int8 is 3x smaller on disk, uses about 35 MB less RAM per handle and loads about 20% faster. It is about
-as fast as fp32, because most of the compute is activation-by-activation products, which stay fp32. Decoded output
-agrees with fp32 on about 96% of spans and 97-99% of utterance read-outs. Accuracy on the Whissle internal held-out test
-set is within 1 point. Toxicity spans are the family that moves most.
+The rest of this page, up to [Speed and memory](#speed-and-memory), describes the dynamic int8 file under ONNX
+Runtime, as measured for v0.3.0. Agreement of the weight-only file was measured on the made-up test texts only (above).
 
-Use int8 when memory or download size matters (edge devices, many handles per process). Use fp32 when you need the
-reference output.
+**Summary (dynamic int8, ONNX Runtime).** int8 is 3x smaller on disk, uses about 35 MB less RAM per handle and loads
+about 15% faster. It is about as fast as fp32, because most of the compute is activation-by-activation products, which
+stay fp32. Decoded output agrees with fp32 on about 96% of spans and 97-99% of utterance read-outs. Accuracy on the
+Whissle internal held-out test set is within 1 point. Toxicity spans are the family that moves most.
 
 ## Quantisation settings
 
@@ -127,41 +144,39 @@ matters most to you, run fp32 for that stream.
 
 ## Speed and memory
 
-The table compares fp32 and int8 at 1 and 4 threads with `bench`:
+`bench` with each backend and model file at 1 and 4 threads:
 
-- `examples/data/*.txt` (636 words), 1,000 streamed words, each pushed on its own and polled;
+- `examples/data/*.txt`, 600 streamed words, each pushed on its own and polled;
 - `stream_ctx` 256;
-- batch = `tag_text` per line, 3 passes;
-- AMD Threadripper 2970WX, shared with other jobs (load average about 18 of 48 threads), nice 19, best of two runs.
+- batch = `tag_text` per line, 2 passes;
+- AMD Threadripper 2970WX, shared with other jobs (load average about 12), nice 19.
 
-Absolute numbers on a quiet machine will be lower. The ratios are what to compare.
+Absolute numbers on a quiet machine will be lower. The ratios are what to compare. Streaming is p50 / p95 ms per word.
 
-| | fp32, 1 thread | int8, 1 thread | fp32, 4 threads | int8, 4 threads |
-|---|---|---|---|---|
-| model file | 34.0 MB | 11.5 MB | 34.0 MB | 11.5 MB |
-| load (create) | 557 ms | 446 ms | 583 ms | 488 ms |
-| streaming ms per word, p50 / p95 | 138 / 168 | 137 / 175 | 116 / 151 | 109 / 127 |
-| batch ms per word | 0.45 | 0.41 | 0.49 | 0.42 |
-| peak RSS | 110 MB | 76 MB | 114 MB | 76 MB |
-
-With `stream_ctx` 96 (the `edge_low_latency.json` setting, 1 thread):
-
-| | fp32 | int8 |
-|---|---|---|
-| streaming ms per word, p50 / p95 | 40 / 54 | 38 / 53 |
-| peak RSS | 97 MB | 63 MB |
+| backend, model file | file | load | streaming, 1 thread | streaming, 4 threads | batch ms/word, 1 / 4 threads | peak RSS |
+|---|---|---|---|---|---|---|
+| ONNX Runtime, fp32 | 34.0 MB | 479 ms | 122 / 191 | 99 / 108 | 0.50 / 0.34 | 118 MB |
+| ONNX Runtime, dynamic int8 | 11.5 MB | 404 ms | 121 / 127 | 94 / 100 | 0.38 / 0.36 | 76 MB |
+| ONNX Runtime, weight-only int8 | 9.4 MB | 510 ms | 173 / 192 | 99 / 108 | 0.53 / 0.37 | 117 MB |
+| native, fp32 | 34.0 MB | 70 ms | 2.6 / 2.8 | 2.5 / 2.6 | 0.59 / 0.59 | 72 MB |
+| native, dynamic int8 | 11.5 MB | 57 ms | 2.5 / 2.7 | 2.6 / 2.9 | 0.61 / 0.59 | 51 MB |
+| **native, weight-only int8** | **9.4 MB** | **40 ms** | **1.2 / 1.3** | 1.2 / 1.4 | 0.53 / 0.51 | **26 MB** |
 
 Notes:
 
-- **Streaming cost is set by `stream_ctx`.** Every poll re-runs the last `stream_ctx` words, so a per-word poll costs
-  about `stream_ctx` x the batch per-word cost. Poll per ASR update rather than per word, or lower `stream_ctx`.
-- **Extra threads help little.** The model is small and its runtime is dominated by many small ops.
+- **The native backend uses one thread**, so its 4-thread rows equal the 1-thread rows within noise.
+- **Under ONNX Runtime, streaming cost is set by `stream_ctx`.** Every poll re-runs the last `stream_ctx` words, so a
+  per-word poll costs about `stream_ctx` x the batch per-word cost; with `stream_ctx` 96 (`edge_low_latency.json`) it is
+  about 40 ms per word. The native backend's poll costs about one word.
+- **Under ONNX Runtime the weight-only file runs at fp32 speed and memory**: its tables become float once, at load.
+- **Extra ONNX Runtime threads help little.** The model is small and its runtime is dominated by many small ops.
 
 ## Things to know
 
-- **int8 streaming scores depend on the window.** Dynamic quantisation computes activation scales per call, so the
-  same words can score slightly differently in a 256-word streaming window than in the full-text pass. fp32 does not
-  have this effect: streaming and offline agree within 1e-4. `parity_int8` therefore checks the offline output
-  bit-exactly against the int8 Python reference and only counts the streaming differences.
-- **Thresholds are shared.** Both graphs use the same thresholds in `arctag_meta.json`; there are no int8-specific
+- **Dynamic int8 streaming scores depend on the window under ONNX Runtime.** Dynamic quantisation computes activation
+  scales per call, so the same words can score slightly differently in a 256-word streaming window than in the
+  full-text pass. fp32, the weight-only file and the native backend do not have this effect. `parity_int8` therefore
+  checks the ONNX Runtime offline output bit-exactly against the int8 Python reference and only counts the streaming
+  differences; `native_int8_stream` requires native streaming to equal the native offline pass exactly.
+- **Thresholds are shared.** All model files use the same thresholds in `arctag_meta.json`; there are no int8-specific
   thresholds.

@@ -1,12 +1,14 @@
-/* bench: load time, streaming per-word latency, batch throughput and peak RSS of one precision (one process per variant, so
- * the RSS is that variant's).
- *   bench [-m MODEL_DIR] [--int8] [-t THREADS] [-d DOMAIN] [-w WORDS] [-r REPEATS] [--stream-ctx N] FILE...
+/* bench: load time, streaming per-word latency, batch throughput and peak RSS of one backend and precision (one process per
+ * variant, so the RSS is that variant's).
+ *   bench [-m MODEL_DIR] [--int8] [--backend native|onnxruntime] [--model-file F] [-t THREADS] [-d DOMAIN] [-w WORDS]
+ *         [-r REPEATS] [--stream-ctx N] [--stream-state on|off] FILE...
  * Streaming: the words of the files are pushed one at a time (endpoint after . ? !) and arctag_poll is called after every
  * word; the latency of push+poll is recorded per word (first 32 warm-up words dropped), -w words in total (default 2000).
  * Batch: every line of the files is tagged with arctag_tag_text, -r times (default 3); ms per word = total / words.
  * Prints one JSON line. */
 #include "arctag.h"
 #include "ex_time.h"
+#include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,7 +32,8 @@ static double peak_rss_mb(void) {
 }
 
 int main(int argc, char **argv) {
-    const char *model = getenv("ARCTAG_MODEL_DIR"), *domain = NULL, *sctx = NULL; int int8 = 0, threads = 1, nw = 2000, reps = 3;
+    const char *model = getenv("ARCTAG_MODEL_DIR"), *domain = NULL, *sctx = NULL, *backend = NULL, *mfile = NULL, *sstate = NULL;
+    int int8 = 0, threads = 1, nw = 2000, reps = 3;
     const char *files[64]; int nf = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
@@ -40,7 +43,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-w") && i + 1 < argc) nw = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stream-ctx") && i + 1 < argc) sctx = argv[++i];
-        else if (argv[i][0] == '-') { fprintf(stderr, "usage: %s [-m MODEL_DIR] [--int8] [-t THREADS] [-d DOMAIN] [-w WORDS] [-r REPEATS] [--stream-ctx N] FILE...\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
+        else if (!strcmp(argv[i], "--model-file") && i + 1 < argc) mfile = argv[++i];
+        else if (!strcmp(argv[i], "--stream-state") && i + 1 < argc) sstate = argv[++i];
+        else if (argv[i][0] == '-') {
+            fprintf(stderr, "usage: %s [-m MODEL_DIR] [--int8] [--backend native|onnxruntime] [--model-file F] [-t THREADS] [-d DOMAIN] [-w WORDS] [-r REPEATS] [--stream-ctx N] [--stream-state on|off] FILE...\n", argv[0]);
+            return 2;
+        }
         else if (nf < 64) files[nf++] = argv[i];
     }
     if (!nf) { fprintf(stderr, "no input files\n"); return 2; }
@@ -58,11 +67,13 @@ int main(int argc, char **argv) {
         }
         fclose(fp);
     }
-    char err[512]; arctag_options o; arctag_options_init(&o); o.precision = int8 ? ARCTAG_INT8 : ARCTAG_FP32; o.threads = threads;
+    char err[512]; arctag_options o; arctag_options_init(&o); o.precision = int8 ? ARCTAG_INT8 : ARCTAG_FP32; o.threads = threads; o.model_file = mfile;
+    if (backend) o.backend = !strcmp(backend, "onnxruntime") || !strcmp(backend, "ort") ? ARCTAG_BACKEND_ONNXRUNTIME : ARCTAG_BACKEND_NATIVE;
     double t0 = now_ms(); arctag_t *h = arctag_create_ex(model ? model : "model", &o, err, sizeof err); double load = now_ms() - t0;
     if (!h) { fprintf(stderr, "%s\n", err); return int8 && strstr(err, "arctag_int8.onnx") ? 77 : 1; }
     if (domain && arctag_set_option(h, "domain", domain)) { fprintf(stderr, "%s\n", arctag_last_error(h)); return 1; }
     if (sctx && arctag_set_option(h, "stream_ctx", sctx)) { fprintf(stderr, "%s\n", arctag_last_error(h)); return 1; }
+    if (sstate && arctag_set_option(h, "stream_state", sstate)) { fprintf(stderr, "%s\n", arctag_last_error(h)); return 1; }
     /* streaming */
     double *lat = (double *)malloc(sizeof(double) * (size_t)(nw + 64)); int nlat = 0, pushed = 0;
     char msg[2048];
@@ -93,10 +104,12 @@ int main(int argc, char **argv) {
         for (int l = 0; l < nl; l++) { char *out = arctag_tag_text(h, lines[l]); arctag_free_str(out); }
     double batch_ms_word = (now_ms() - tb) / (double)(total_words * reps);
     char *info = arctag_info(h);
-    printf("{\"precision\":\"%s\",\"threads\":%d,\"load_ms\":%.1f,\"stream_words\":%d,\"stream_ms_per_word\":{\"p50\":%.3f,\"p95\":%.3f,\"mean\":%.3f},"
+    cJSON *ij = cJSON_Parse(info);
+    const char *bn = cJSON_GetStringValue(cJSON_GetObjectItem(ij, "backend")), *wk = cJSON_GetStringValue(cJSON_GetObjectItem(ij, "weights"));
+    printf("{\"backend\":\"%s\",\"weights\":\"%s\",\"precision\":\"%s\",\"threads\":%d,\"load_ms\":%.1f,\"stream_words\":%d,\"stream_ms_per_word\":{\"p50\":%.3f,\"p95\":%.3f,\"mean\":%.3f},"
            "\"batch_words\":%ld,\"batch_ms_per_word\":%.4f,\"peak_rss_mb\":%.1f}\n",
-           int8 ? "int8" : "fp32", threads, load, nlat, pct(lat, nlat, .5), pct(lat, nlat, .95), mean, total_words * reps, batch_ms_word, peak_rss_mb());
-    arctag_free_str(info); free(lat);
+           bn ? bn : "?", wk ? wk : "", int8 ? "int8" : "fp32", threads, load, nlat, pct(lat, nlat, .5), pct(lat, nlat, .95), mean, total_words * reps, batch_ms_word, peak_rss_mb());
+    cJSON_Delete(ij); arctag_free_str(info); free(lat);
     for (int l = 0; l < nl; l++) free(lines[l]);
     free(lines); arctag_destroy(h);
     return 0;

@@ -6,7 +6,10 @@
  * polling gives the same spans, events and utterance read-outs as arctag_tag_text. With --int8 the streaming differences are
  * counted but do not fail: dynamic quantisation scales activations per call, so a shorter streaming window gives slightly
  * different scores than the full-text pass (see docs/int8.md); the int8_agreement test bounds them instead.
- *   test_parity MODEL_DIR reference.json [--int8] [--tol X] [--threads N] */
+ * --backend B runs the library on that backend. --stream-only skips the comparison with the reference and only checks that
+ * streaming gives the same output as the library's own offline pass, strictly (used for int8 on the native backend, whose
+ * scores are not the reference's because ONNX Runtime quantises activations and the native backend does not).
+ *   test_parity MODEL_DIR reference.json [--int8] [--tol X] [--threads N] [--backend native|onnxruntime] [--model-file F] [--stream-only] */
 #include "arctag.h"
 #include "cJSON.h"
 #include <math.h>
@@ -16,7 +19,7 @@
 
 static double TOL = 1e-6, STOL = 1e-4;        /* STOL: streaming vs offline (partial-input runs: float noise only) */
 static double *tolp = &TOL;
-static int fails = 0, ndiff = 0, soft_stream = 0, nsoft = 0;
+static int fails = 0, ndiff = 0, soft_stream = 0, nsoft = 0, stream_only = 0;
 static double maxd = 0;
 static const char *ctx = "";
 
@@ -124,7 +127,11 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--int8")) { o.precision = ARCTAG_INT8; soft_stream = 1; }
         else if (!strcmp(argv[i], "--tol") && i + 1 < argc) TOL = atof(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) o.threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--model-file") && i + 1 < argc) o.model_file = argv[++i];
+        else if (!strcmp(argv[i], "--stream-only")) stream_only = 1;
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) { i++; o.backend = !strcmp(argv[i], "native") ? ARCTAG_BACKEND_NATIVE : ARCTAG_BACKEND_ONNXRUNTIME; }
     }
+    if (stream_only) soft_stream = 0;
     char err[512];
     arctag_t *h = arctag_create_ex(argv[1], &o, err, sizeof err);
     if (!h) {   /* 77 = skipped: the int8 graph is optional in a model dir */
@@ -148,7 +155,7 @@ int main(int argc, char **argv) {
         char *out = arctag_tag_text(hc, S(c, "text"));
         cJSON *got = out ? cJSON_Parse(out) : NULL; arctag_free_str(out);
         if (!got) { bad("tag_text", arctag_last_error(hc)); continue; }
-        cJSON *want = cJSON_GetObjectItem(c, "result");
+        cJSON *want = stream_only ? got : cJSON_GetObjectItem(c, "result");
         str("profile", S(got, "profile"), S(want, "profile"));
         cmp_list("spans", cJSON_GetObjectItem(got, "spans"), cJSON_GetObjectItem(want, "spans"), "type", "score");
         cmp_list("events", cJSON_GetObjectItem(got, "events"), cJSON_GetObjectItem(want, "events"), "type", "score");
@@ -161,6 +168,7 @@ int main(int argc, char **argv) {
         cJSON_Delete(got);
         if (hc != h) arctag_destroy(hc);
     }
+    if (stream_only) printf("streaming vs the library's own offline output only (--stream-only)\n");
     printf("parity (%s): %d cases (%d with a config), %d reference spans, %d mismatches, max |score diff| %.2e (tol %.0e), %d scores not bit-equal (streaming tol %.0e)\n",
            o.precision == ARCTAG_INT8 ? "int8" : "fp32", n, nopt, nspans, fails, maxd, TOL, ndiff, STOL);
     if (soft_stream) printf("streaming vs offline (int8, not checked: per-call activation scales): %d differing fields\n", nsoft);

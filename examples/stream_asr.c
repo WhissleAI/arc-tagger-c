@@ -5,7 +5,7 @@
  *   {"type": "endpoint"}                      end of utterance (VAD / speech_final / end of turn)
  * Interim words are revisions: each interim / final message replaces everything after the last final word (push_words
  * with "from"). After each message the app polls and keeps a span list: spans with end > a0 are replaced by the poll's.
- *   stream_asr [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-d DOMAIN] [--every N] [INPUT.jsonl|-]
+ *   stream_asr [-m MODEL_DIR] [-c CONFIG.json] [--int8] [--backend B] [-d DOMAIN] [--every N] [INPUT.jsonl|-]
  * --every N polls after every N messages (default 1). Prints one line per poll: n_words, new events, closed utterances
  * (intent / act / safety that are on), and at the end the final span list. */
 #include "arctag.h"
@@ -29,6 +29,7 @@ static void print_on(const char *label, cJSON *u, const char *key) {
 
 int main(int argc, char **argv) {
     const char *model = NULL, *config = NULL, *domain = NULL, *in = "-";
+    const char *backend = NULL;
     int int8 = 0, every = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
@@ -36,7 +37,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) domain = argv[++i];
         else if (!strcmp(argv[i], "--every") && i + 1 < argc) every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--int8")) int8 = 1;
-        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-d DOMAIN] [--every N] [INPUT|-]\n", argv[0]); return 2; }
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend = argv[++i];
+        else if (argv[i][0] == '-' && argv[i][1]) { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8] [--backend B] [-d DOMAIN] [--every N] [INPUT|-]\n", argv[0]); return 2; }
         else in = argv[i];
     }
     if (every < 1) every = 1;
@@ -45,6 +47,7 @@ int main(int argc, char **argv) {
     if (config) h = arctag_create_from_config(model, config, err, sizeof err);
     else { arctag_options o; arctag_options_init(&o); o.precision = int8 ? ARCTAG_INT8 : ARCTAG_FP32; h = arctag_create_ex(model ? model : "model", &o, err, sizeof err); }
     if (!h) { fprintf(stderr, "arctag: %s\n", err); return 1; }
+    if (backend && arctag_set_option(h, "backend", backend)) { fprintf(stderr, "backend: %s\n", arctag_last_error(h)); arctag_destroy(h); return 1; }
     if ((config && int8 && arctag_set_option(h, "precision", "int8")) || (domain && arctag_set_option(h, "domain", domain))) {
         fprintf(stderr, "option: %s\n", arctag_last_error(h)); arctag_destroy(h); return 1;
     }

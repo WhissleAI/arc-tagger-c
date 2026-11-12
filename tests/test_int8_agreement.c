@@ -1,7 +1,8 @@
 /* int8 vs fp32 on the reference texts (tests/expected/reference.json cases without a config): decoded spans (exact type +
  * word range), events (type + word) and utterance read-outs that are "on" must agree with F1 >= --min-f1 (default 0.90), and
  * the max |p| difference of the reported scores stays under --max-dp (default 0.25). Prints per-family numbers.
- *   test_int8_agreement MODEL_DIR reference.json [--min-f1 X] [--max-dp X] */
+ * --backend B runs both on that backend; --model-file F takes the int8 model from F instead of arctag_int8.onnx.
+ *   test_int8_agreement MODEL_DIR reference.json [--min-f1 X] [--max-dp X] [--backend native|onnxruntime] [--model-file F] */
 #include "arctag.h"
 #include "cJSON.h"
 #include <math.h>
@@ -51,14 +52,17 @@ static int keys(cJSON *r, char (*k)[200], int *g, double *p, int cap) {
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s MODEL_DIR reference.json [--min-f1 X] [--max-dp X]\n", argv[0]); return 2; }
-    double min_f1 = 0.90, max_dp = 0.25;
+    double min_f1 = 0.90, max_dp = 0.25; const char *mfile = NULL; arctag_backend_t be = ARCTAG_BACKEND_DEFAULT;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--min-f1") && i + 1 < argc) min_f1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max-dp") && i + 1 < argc) max_dp = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--model-file") && i + 1 < argc) mfile = argv[++i];
+        else if (!strcmp(argv[i], "--backend") && i + 1 < argc) { i++; be = !strcmp(argv[i], "native") ? ARCTAG_BACKEND_NATIVE : ARCTAG_BACKEND_ONNXRUNTIME; }
     }
     char err[512]; arctag_t *h[2];
     for (int v = 0; v < 2; v++) {
-        arctag_options o; arctag_options_init(&o); o.precision = v ? ARCTAG_INT8 : ARCTAG_FP32; o.threads = 1;
+        arctag_options o; arctag_options_init(&o); o.precision = v ? ARCTAG_INT8 : ARCTAG_FP32; o.threads = 1; o.backend = be;
+        if (v && mfile) o.model_file = mfile;
         h[v] = arctag_create_ex(argv[1], &o, err, sizeof err);
         if (!h[v]) { fprintf(stderr, "%s: %s\n", v ? "int8" : "fp32", err); if (v) arctag_destroy(h[0]); return v ? 77 : 1; }    /* 77 = skipped (no int8 graph) */
     }

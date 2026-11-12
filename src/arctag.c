@@ -1,11 +1,16 @@
-/* arctag: Arc Tagger C library (ONNX Runtime C API). Decoding: the T0 (zero-lag) tier of Arc Tagger (see README). */
+/* arctag: Arc Tagger C library. Two backends run the model: native (plain C, src/native.c) and ONNX Runtime (built with
+ * ARCTAG_WITH_ORT). Features, streaming, decoding and JSON are shared. */
 #include "arctag.h"
 #include "tokenizer.h"
+#include "native.h"
 #include "cJSON.h"
+#ifdef ARCTAG_WITH_ORT
 #include <onnxruntime_c_api.h>
+#endif
 #include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,8 +75,13 @@ static const char *RCAT[N_RCAT] = {"phone", "email", "address", "card", "gov_id"
 static const char *RLAB[N_RCAT] = {"PHONE", "EMAIL", "ADDRESS", "CARD", "GOV_ID", "DOB", "NAME", "HANDLE", "CONTACT", "PROFANITY", "TOXIC"};
 
 struct arctag {
+#ifdef ARCTAG_WITH_ORT
     const OrtApi *ort; OrtEnv *env; OrtSession *sess; OrtMemoryInfo *mem;
-    char *model_dir, *model_path, *model_file; int threads, precision;
+#endif
+    nat_model *nm; nat *one, *st;          /* native backend: model, one-pass state, streaming state */
+    int noff[MAX_OUT], ndim[MAX_OUT], ntotal;
+    float *rows; int rcap, rbase, sdone, sdirty, svalid, st_cap, st_dom, st_spk, st_asr, stream_state;
+    char *model_dir, *model_path, *model_file; int threads, precision, backend;
     meta_t m; arctok_t *tok;
     int prof, base_prof, asr, max_ctx, stream_ctx;
     double *thr[NQ]; double head[MAX_FAM];   /* thresholds of the active profile with the overrides applied */
@@ -354,42 +364,24 @@ static int fine_hint(const arctag_t *h, const char *ui, const char *const *words
     return -1;
 }
 
-/* ------------------------------------------------------------------ ONNX Runtime */
-#define ORT_CHECK(h, expr) do { OrtStatus *st_ = (expr); if (st_) { set_err(h, "onnxruntime: %s", (h)->ort->GetErrorMessage(st_)); (h)->ort->ReleaseStatus(st_); goto fail; } } while (0)
-
-static int open_session(arctag_t *h) {
-    OrtSessionOptions *so = NULL; OrtSession *ns = NULL;
-    ORT_CHECK(h, h->ort->CreateSessionOptions(&so));
-    ORT_CHECK(h, h->ort->SetIntraOpNumThreads(so, h->threads));
-    ORT_CHECK(h, h->ort->SetInterOpNumThreads(so, 1));
-    ORT_CHECK(h, h->ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
-#ifdef _WIN32
-    {
-        int n = MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, NULL, 0);
-        wchar_t *wp = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)n);
-        MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, wp, n);
-        OrtStatus *st = h->ort->CreateSession(h->env, wp, so, &ns);
-        free(wp);
-        ORT_CHECK(h, st);
-    }
-#else
-    ORT_CHECK(h, h->ort->CreateSession(h->env, h->model_path, so, &ns));
-#endif
-    h->ort->ReleaseSessionOptions(so);
-    if (h->sess) h->ort->ReleaseSession(h->sess);       /* swap only once the new session loaded */
-    h->sess = ns;
-    return 0;
-fail:
-    if (so) h->ort->ReleaseSessionOptions(so);
-    return -1;
-}
-
+/* ------------------------------------------------------------------ backends
+ * Both backends produce the same thing: the graph's outputs for words [a, b) as float rows (run_t). The native backend also
+ * keeps a streaming state between polls (nat_window), so a poll only computes the words that are new since the last one. */
 typedef struct {
-    int W; OrtValue *vals[MAX_OUT]; float *o[MAX_OUT]; int dim[MAX_OUT];
+    int W; float *o[MAX_OUT]; int dim[MAX_OUT], st[MAX_OUT];   /* output i, row r, column c: o[i][r * st[i] + c] */
+    float *own;                                                /* native: rows owned by this result (NULL for the stream cache) */
+#ifdef ARCTAG_WITH_ORT
+    OrtValue *vals[MAX_OUT];
+#endif
 } run_t;
 
 static void run_free(arctag_t *h, run_t *r) {
+#ifdef ARCTAG_WITH_ORT
     for (int i = 0; i < h->nout; i++) if (r->vals[i]) h->ort->ReleaseValue(r->vals[i]);
+#else
+    (void)h;
+#endif
+    free(r->own);
     memset(r, 0, sizeof *r);
 }
 
@@ -410,19 +402,15 @@ static void digit_flags(const char *s, int *hd, int *all) {
     *hd = any; *all = any && every;
 }
 
-/* model inputs for words[a..b) (features computed sequentially from word 0), us = utterance starts */
-static int run_model(arctag_t *h, const word_t *ws, int n_all, int a, int b, const unsigned char *us, run_t *r) {
-    int W = b - a;
-    memset(r, 0, sizeof *r); r->W = W;
-    int64_t *pcs = (int64_t *)calloc((size_t)W * P_MAX, 8), *npc = (int64_t *)calloc((size_t)W, 8), *wfl = (int64_t *)calloc((size_t)W * 5, 8),
-            *feats = (int64_t *)calloc((size_t)W * NFEAT, 8), *src = (int64_t *)calloc((size_t)W, 8), *spk = (int64_t *)calloc((size_t)W, 8),
-            *ust = (int64_t *)calloc((size_t)W, 8), dom = h->m.prof[h->prof].dom;
-    OrtValue *in[8] = {0};
-    int ok = -1;
-    if (!pcs || !npc || !wfl || !feats || !src || !spk || !ust) { set_err(h, "out of memory"); goto done; }
-    int spksrc = 0;
-    for (int i = 0; i < n_all; i++) if (ws[i].spk) { spksrc = 2; break; }
-    /* sequential feature state */
+/* model inputs, one word per row */
+typedef struct { int64_t pcs[P_MAX], npc, wfl[5], feats[NFEAT], src, spk, ust; } inrow_t;
+
+static int any_speaker(const word_t *ws, int n) { for (int i = 0; i < n; i++) if (ws[i].spk) return 1; return 0; }
+
+/* inputs for words[a..b) (features computed sequentially from word 0); us[k] = 1 if word a + k starts an utterance.
+ * The first word of a pass always starts one: force_first. */
+static void build_inputs(const arctag_t *h, const word_t *ws, int n_all, int a, int b, const unsigned char *us, int force_first, inrow_t *in) {
+    int spksrc = any_speaker(ws, n_all) ? 2 : 0;
     int have_prev = 0; double prev_t1 = 0; int prev_has_t1 = 0; const char *prev_spk = NULL;
     const char *slot_names[16]; int nslots = 0;
     for (int i = 0; i < b; i++) {
@@ -451,17 +439,97 @@ static int run_model(arctag_t *h, const word_t *ws, int n_all, int a, int b, con
         have_prev = 1;
         if (i < a) continue;
         int k = i - a, hd, all;
+        inrow_t *x = &in[k];
+        memset(x, 0, sizeof *x);
         digit_flags(w->w, &hd, &all);
-        for (int p = 0; p < w->npc; p++) pcs[k * P_MAX + p] = w->pcs[p];
-        npc[k] = w->npc;
+        for (int p = 0; p < w->npc; p++) x->pcs[p] = w->pcs[p];
+        x->npc = w->npc;
         int64_t fl[5] = {hd, all, w->npc < P_MAX ? w->npc : P_MAX, fd, fg};
-        memcpy(wfl + k * 5, fl, sizeof fl);
+        memcpy(x->wfl, fl, sizeof fl);
         int64_t fe[NFEAT] = {gap, dur, fin, conf, chg, h->asr, spksrc, 0};
-        memcpy(feats + k * NFEAT, fe, sizeof fe);
-        src[k] = (h->asr >= 0 && !strcmp(h->m.asr[h->asr], "arc_transcriber")) ? 1 : 0;
-        spk[k] = sp; ust[k] = us[k] ? 1 : 0;
+        memcpy(x->feats, fe, sizeof fe);
+        x->src = (h->asr >= 0 && !strcmp(h->m.asr[h->asr], "arc_transcriber")) ? 1 : 0;
+        x->spk = sp; x->ust = us[k] ? 1 : 0;
     }
-    ust[0] = 1;
+    if (force_first && b > a) in[0].ust = 1;
+}
+
+static void nat_input(const inrow_t *x, nat_word *o) {
+    memset(o, 0, sizeof *o);
+    for (int p = 0; p < P_MAX && p < 8; p++) o->pcs[p] = (int)x->pcs[p];
+    o->npc = (int)x->npc;
+    for (int k = 0; k < 5; k++) o->wfl[k] = (int)x->wfl[k];
+    for (int k = 0; k < NFEAT && k < 8; k++) o->feats[k] = (int)x->feats[k];
+    o->src = (int)x->src; o->spk = (int)x->spk; o->ust = (int)x->ust;
+}
+
+/* point a result at native rows (stride = all outputs of a word) */
+static void nat_view(const arctag_t *h, float *rows, int W, run_t *r) {
+    r->W = W;
+    for (int i = 0; i < h->nout; i++) { r->o[i] = rows + h->noff[i]; r->dim[i] = h->ndim[i]; r->st[i] = h->ntotal; }
+}
+
+#ifdef ARCTAG_WITH_ORT
+#define ORT_CHECK(h, expr) do { OrtStatus *st_ = (expr); if (st_) { set_err(h, "onnxruntime: %s", (h)->ort->GetErrorMessage(st_)); (h)->ort->ReleaseStatus(st_); goto fail; } } while (0)
+
+static int open_ort(arctag_t *h) {
+    OrtSessionOptions *so = NULL; OrtSession *ns = NULL;
+    if (!h->ort) {
+        const OrtApiBase *base = OrtGetApiBase();
+        h->ort = base ? base->GetApi(ORT_API_VERSION) : NULL;
+        if (!h->ort) { set_err(h, "onnxruntime: API version %d not supported by the loaded library", ORT_API_VERSION); return -1; }
+    }
+    if (!h->env) ORT_CHECK(h, h->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "arctag", &h->env));
+    if (!h->mem) ORT_CHECK(h, h->ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &h->mem));
+    ORT_CHECK(h, h->ort->CreateSessionOptions(&so));
+    ORT_CHECK(h, h->ort->SetIntraOpNumThreads(so, h->threads));
+    ORT_CHECK(h, h->ort->SetInterOpNumThreads(so, 1));
+    ORT_CHECK(h, h->ort->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL));
+    /* A model stored with int8 weight tables (tools/quantize_model.py) has DequantizeLinear nodes on constant inputs. By
+     * default ONNX Runtime keeps them for its quantised-graph passes and runs them on every call; with those passes off
+     * they fold into float tables once, at load. */
+    ORT_CHECK(h, h->ort->AddSessionConfigEntry(so, "session.disable_quant_qdq", "1"));
+#ifdef _WIN32
+    {
+        int n = MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, NULL, 0);
+        wchar_t *wp = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)n);
+        MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, wp, n);
+        OrtStatus *st = h->ort->CreateSession(h->env, wp, so, &ns);
+        free(wp);
+        ORT_CHECK(h, st);
+    }
+#else
+    ORT_CHECK(h, h->ort->CreateSession(h->env, h->model_path, so, &ns));
+#endif
+    h->ort->ReleaseSessionOptions(so);
+    if (h->sess) h->ort->ReleaseSession(h->sess);       /* swap only once the new session loaded */
+    h->sess = ns;
+    return 0;
+fail:
+    if (so) h->ort->ReleaseSessionOptions(so);
+    return -1;
+}
+
+static void close_ort(arctag_t *h) {
+    if (!h->ort) return;
+    if (h->sess) h->ort->ReleaseSession(h->sess);
+    if (h->mem) h->ort->ReleaseMemoryInfo(h->mem);
+    if (h->env) h->ort->ReleaseEnv(h->env);
+    h->sess = NULL; h->mem = NULL; h->env = NULL;
+}
+
+static int run_ort(arctag_t *h, const inrow_t *rows, int W, run_t *r) {
+    int64_t *pcs = (int64_t *)calloc((size_t)W * P_MAX, 8), *npc = (int64_t *)calloc((size_t)W, 8), *wfl = (int64_t *)calloc((size_t)W * 5, 8),
+            *feats = (int64_t *)calloc((size_t)W * NFEAT, 8), *src = (int64_t *)calloc((size_t)W, 8), *spk = (int64_t *)calloc((size_t)W, 8),
+            *ust = (int64_t *)calloc((size_t)W, 8), dom = h->m.prof[h->prof].dom;
+    OrtValue *in[8] = {0};
+    int ok = -1;
+    if (!pcs || !npc || !wfl || !feats || !src || !spk || !ust) { set_err(h, "out of memory"); goto done; }
+    for (int k = 0; k < W; k++) {
+        memcpy(pcs + k * P_MAX, rows[k].pcs, sizeof rows[k].pcs); npc[k] = rows[k].npc;
+        memcpy(wfl + k * 5, rows[k].wfl, sizeof rows[k].wfl); memcpy(feats + k * NFEAT, rows[k].feats, sizeof rows[k].feats);
+        src[k] = rows[k].src; spk[k] = rows[k].spk; ust[k] = rows[k].ust;
+    }
     {
         const char *in_names[8] = {"pcs", "npc", "wfl", "feats", "src", "spk", "ustart", "dom"};
         int64_t *bufs[8] = {pcs, npc, wfl, feats, src, spk, ust, &dom};
@@ -478,7 +546,7 @@ static int run_model(arctag_t *h, const word_t *ws, int n_all, int a, int b, con
             ORT_CHECK(h, h->ort->GetDimensionsCount(ti, &nd));
             ORT_CHECK(h, h->ort->GetDimensions(ti, dims, nd < 4 ? nd : 4));
             h->ort->ReleaseTensorTypeAndShapeInfo(ti);
-            r->dim[i] = nd >= 2 ? (int)dims[1] : 1;
+            r->dim[i] = nd >= 2 ? (int)dims[1] : 1; r->st[i] = r->dim[i];
             ORT_CHECK(h, h->ort->GetTensorMutableData(r->vals[i], (void **)&r->o[i]));
         }
     }
@@ -487,14 +555,113 @@ fail:
 done:
     for (int i = 0; i < 8; i++) if (in[i]) h->ort->ReleaseValue(in[i]);
     free(pcs); free(npc); free(wfl); free(feats); free(src); free(spk); free(ust);
-    if (ok) run_free(h, r);
     return ok;
+}
+#endif
+
+/* native, one pass over W words from a fresh state (the same as one ONNX Runtime run) */
+static int run_native(arctag_t *h, const inrow_t *rows, int W, run_t *r) {
+    int dom = h->m.prof[h->prof].dom;
+    if (!h->one && !(h->one = nat_new(h->nm, dom, h->m.max_ctx > 0 ? h->m.max_ctx : 2048, h->m.max_ctx > 0 ? h->m.max_ctx : 2048))) { set_err(h, "out of memory"); return -1; }
+    if (W > h->m.max_ctx && h->m.max_ctx > 0) { set_err(h, "pass of %d words is longer than the model's context", W); return -1; }
+    nat_word *in = (nat_word *)malloc(sizeof(nat_word) * (size_t)(W > 0 ? W : 1));
+    r->own = (float *)malloc(sizeof(float) * (size_t)h->ntotal * (size_t)(W > 0 ? W : 1));
+    if (!in || !r->own) { free(in); free(r->own); r->own = NULL; set_err(h, "out of memory"); return -1; }
+    for (int k = 0; k < W; k++) nat_input(&rows[k], &in[k]);
+    if (nat_set_domain(h->one, dom)) { free(in); free(r->own); r->own = NULL; set_err(h, "domain %d out of range", dom); return -1; }
+    nat_set_snapshots(h->one, 0);
+    nat_steps(h->one, in, W, r->own);
+    free(in);
+    nat_view(h, r->own, W, r);
+    if (W > 512) { nat_free(h->one); h->one = NULL; }   /* do not keep a long pass's memory */
+    return 0;
+}
+
+/* model outputs for words[a..b) in one pass from a fresh state, us = utterance starts (us[0] is forced on) */
+static int run_model(arctag_t *h, const word_t *ws, int n_all, int a, int b, const unsigned char *us, run_t *r) {
+    int W = b - a;
+    memset(r, 0, sizeof *r); r->W = W;
+    inrow_t *rows = (inrow_t *)malloc(sizeof(inrow_t) * (size_t)(W > 0 ? W : 1));
+    if (!rows) { set_err(h, "out of memory"); return -1; }
+    build_inputs(h, ws, n_all, a, b, us, 1, rows);
+    int rc;
+#ifdef ARCTAG_WITH_ORT
+    if (h->backend == ARCTAG_BACKEND_ONNXRUNTIME) rc = run_ort(h, rows, W, r);
+    else
+#endif
+    rc = run_native(h, rows, W, r);
+    free(rows);
+    if (rc) run_free(h, r);
+    return rc;
+}
+
+/* ---- native streaming: the state continues from poll to poll; rows of words [rbase, sdone) are cached */
+static void stream_invalidate(arctag_t *h) { h->sdone = h->rbase = 0; h->sdirty = 0; h->svalid = 0; }
+
+static int rows_reserve(arctag_t *h, int nrows) {
+    if (nrows <= h->rcap) return 0;
+    int c = h->rcap ? h->rcap : 256; while (c < nrows) c *= 2;
+    float *p = (float *)realloc(h->rows, sizeof(float) * (size_t)h->ntotal * (size_t)c);
+    if (!p) { set_err(h, "out of memory"); return -1; }
+    h->rows = p; h->rcap = c;
+    return 0;
+}
+
+/* rows for words[s..n) of the stream, from the state where possible */
+static int nat_window(arctag_t *h, int s, int n, run_t *r) {
+    int dom = h->m.prof[h->prof].dom, spksrc = any_speaker(h->words, n);
+    memset(r, 0, sizeof *r);
+    if (!h->st || h->st_cap != h->stream_ctx) {
+        nat_free(h->st); h->st = nat_new(h->nm, dom, h->stream_ctx + NAT_REWIND_WORDS, h->stream_ctx);
+        if (!h->st) { set_err(h, "out of memory"); return -1; }
+        h->st_cap = h->stream_ctx; h->st_dom = dom; h->svalid = 0;
+    }
+    int restart = !h->svalid || h->st_dom != dom || h->st_spk != spksrc || h->st_asr != h->asr || !h->stream_state
+                  || nat_first(h->st) > s || h->sdone > n;
+    if (!restart && h->sdirty < h->sdone) {                 /* a revision: back to a snapshot at or before it */
+        int p = nat_rewind(h->st, h->sdirty);
+        if (p < 0 || p < h->rbase) restart = 1; else h->sdone = p;
+    }
+    if (restart) {
+        if (h->st_dom != dom && nat_set_domain(h->st, dom)) { set_err(h, "domain %d out of range", dom); return -1; }
+        nat_restart(h->st, s);
+        h->st_dom = dom; h->st_spk = spksrc; h->st_asr = h->asr;
+        h->rbase = h->sdone = s; h->svalid = 1;
+    }
+    h->sdirty = INT32_MAX;
+    int a = h->sdone, todo = n - a;
+    if (todo > 0) {
+        if (rows_reserve(h, n - h->rbase)) { h->svalid = 0; return -1; }
+        inrow_t *in = (inrow_t *)malloc(sizeof(inrow_t) * (size_t)todo);
+        nat_word *nw = (nat_word *)malloc(sizeof(nat_word) * (size_t)todo);
+        unsigned char *us = (unsigned char *)calloc((size_t)todo, 1);
+        if (!in || !nw || !us) { free(in); free(nw); free(us); h->svalid = 0; set_err(h, "out of memory"); return -1; }
+        for (int b = 0; b < h->nb; b++) if (h->bounds[b] >= a && h->bounds[b] < n) us[h->bounds[b] - a] = 1;
+        build_inputs(h, h->words, n, a, n, us, a == nat_first(h->st), in);
+        for (int k = 0; k < todo; k++) nat_input(&in[k], &nw[k]);
+        nat_set_snapshots(h->st, 1);
+        nat_steps(h->st, nw, todo, h->rows + (size_t)(a - h->rbase) * h->ntotal);
+        free(in); free(nw); free(us);
+        h->sdone = n;
+    }
+    if (s - h->rbase > 256) {                                /* drop rows older than the window */
+        memmove(h->rows, h->rows + (size_t)(s - h->rbase) * h->ntotal, sizeof(float) * (size_t)h->ntotal * (size_t)(n - s));
+        h->rbase = s;
+    }
+    nat_view(h, h->rows + (size_t)(s - h->rbase) * h->ntotal, n - s, r);
+    return 0;
+}
+
+/* the stream's rows for words[s..n): the native state, or one pass over the window */
+static int run_stream(arctag_t *h, int s, int n, const unsigned char *us, run_t *r) {
+    if (h->backend == ARCTAG_BACKEND_NATIVE) return nat_window(h, s, n, r);
+    return run_model(h, h->words, n, s, n, us, r);
 }
 
 /* probability of read-out q, row (window-relative) r, column c */
 static float P(const arctag_t *h, const run_t *r, int q, int row, int c) {
     int oi = h->qo[q];
-    return r->o[oi][(size_t)row * r->dim[oi] + c];
+    return r->o[oi][(size_t)row * r->st[oi] + c];
 }
 
 /* ------------------------------------------------------------------ JSON helpers */
@@ -738,7 +905,7 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
         if (!m->fam[f].use || !nfc[f]) continue;
         int it = out_index(h, m->fam[f].out_t), ib = out_index(h, m->fam[f].out_b);
         if (it < 0 || ib < 0) continue;
-        int nt = r->dim[it];
+        int nt = r->st[it], sb = r->st[ib];
         int mem[64], nm = 0;
         for (int t = 0; t < m->fam[f].ntags && nm < 64; t++) {
             int c = find_str(m->cols[Q_IN], nin, m->fam[f].tags[t]);
@@ -747,7 +914,7 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
         double th = h->head[f];
         int *lab = (int *)calloc((size_t)W, sizeof(int));
         for (int k = 0; k < W; k++) {
-            const float *pb = r->o[ib] + (size_t)(r0 + k) * 3;
+            const float *pb = r->o[ib] + (size_t)(r0 + k) * sb;
             float pin = 1.0f - pb[0];                                /* float32 (= reference) */
             lab[k] = pin < (float)th ? 0 : ((us[r0 + k] || pb[1] > pb[2]) ? 1 : 2);
         }
@@ -768,7 +935,7 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
                         float v = pt[mem[t]]; if (v < 1e-9f) v = 1e-9f; if (v > 1.0f) v = 1.0f;
                         sc[t] += logf(v); pm[t] += pt[mem[t]];
                     }
-                    float pin = 1.0f - r->o[ib][(size_t)(r0 + x) * 3];
+                    float pin = 1.0f - r->o[ib][(size_t)(r0 + x) * sb];
                     if (x == k || pin > mx) mx = pin;
                 }
                 int b1 = 0; for (int t = 1; t < nm; t++) if (sc[t] > sc[b1]) b1 = t;
@@ -808,9 +975,12 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
             if (ra < 0) ra = 0;
             if (rb > r->W) rb = r->W;
             int cnt = rb > ra ? rb - ra : 0;
-            float mean = cnt ? pairwise_sum_f32(r->o[vm] + ra, cnt) / (float)cnt : 0.0f;    /* numpy float32 mean */
+            float *vv = (float *)malloc(sizeof(float) * (size_t)(cnt > 0 ? cnt : 1));
+            for (int k = 0; vv && k < cnt; k++) vv[k] = r->o[vm][(size_t)(ra + k) * r->st[vm]];
+            float mean = cnt && vv ? pairwise_sum_f32(vv, cnt) / (float)cnt : 0.0f;    /* numpy float32 mean */
+            free(vv);
             int rl = s->b - 1 - off;
-            double v = (double)mean + (rl >= 0 && rl < r->W ? r->o[ve][rl] : 0);
+            double v = (double)mean + (rl >= 0 && rl < r->W ? r->o[ve][(size_t)rl * r->st[ve]] : 0);
             cJSON_AddItemToObject(o, "ver", jnum(1.0 / (1.0 + exp(-v))));
         }
         cJSON_AddItemToArray(out, o);
@@ -1041,17 +1211,83 @@ static void set_model_path(arctag_t *h) {
 void arctag_options_init(arctag_options *o) {
     if (!o) return;
     memset(o, 0, sizeof *o);
-    o->size = sizeof *o; o->precision = ARCTAG_FP32; o->threads = 0; o->model_file = NULL;
+    o->size = sizeof *o; o->precision = ARCTAG_FP32; o->threads = 0; o->model_file = NULL; o->backend = ARCTAG_BACKEND_DEFAULT;
+}
+
+static const char *backend_name(int b) { return b == ARCTAG_BACKEND_ONNXRUNTIME ? "onnxruntime" : "native"; }
+/* -1: unknown name */
+static int backend_of(const char *v) {
+    if (!strcmp(v, "native")) return ARCTAG_BACKEND_NATIVE;
+    if (!strcmp(v, "onnxruntime") || !strcmp(v, "ort")) return ARCTAG_BACKEND_ONNXRUNTIME;
+    if (!strcmp(v, "default") || !*v) return ARCTAG_BACKEND_NATIVE;
+    return -1;
+}
+
+static void close_native(arctag_t *h) {
+    nat_free(h->one); nat_free(h->st); nat_close(h->nm);
+    h->one = h->st = NULL; h->nm = NULL;
+    free(h->rows); h->rows = NULL; h->rcap = 0;
+    stream_invalidate(h);
+}
+
+/* load the model file into the native backend and check it against arctag_meta.json */
+static int open_native(arctag_t *h) {
+    char e[512];
+    nat_model *nm = nat_open(h->model_path, e, sizeof e);
+    if (!nm) { set_err(h, "%s", e); return -1; }
+    int off[NAT_NOUT], o = 0, noff[MAX_OUT], ndim[MAX_OUT];
+    for (int k = 0; k < NAT_NOUT; k++) { off[k] = o; o += nat_out_dim(nm, k); }
+    for (int i = 0; i < h->nout; i++) {
+        int k = -1;
+        for (int j = 0; j < NAT_NOUT; j++) if (!strcmp(h->out_names[i], nat_out_name(j))) k = j;
+        if (k < 0) { set_err(h, "%s: no output %s", h->model_path, h->out_names[i]); nat_close(nm); return -1; }
+        noff[i] = off[k]; ndim[i] = nat_out_dim(nm, k);
+    }
+    for (int q = 0; q < NQ; q++) if (h->m.nc[q] != ndim[h->qo[q]]) {
+        set_err(h, "arctag_meta.json has %d columns for %s, %s has %d: they are not from the same model", h->m.nc[q], QN[q], h->model_path, ndim[h->qo[q]]);
+        nat_close(nm); return -1;
+    }
+    for (int p = 0; p < h->m.nprof; p++) if (h->m.prof[p].dom < 0 || h->m.prof[p].dom >= nat_num_domains(nm)) {
+        set_err(h, "arctag_meta.json: profile %s has domain %d, %s has %d", h->m.prof[p].name, h->m.prof[p].dom, h->model_path, nat_num_domains(nm));
+        nat_close(nm); return -1;
+    }
+    for (int f = 0; f < h->m.nfam; f++) {
+        int it = out_index(h, h->m.fam[f].out_t), ib = out_index(h, h->m.fam[f].out_b);
+        if (it < 0 || ib < 0 || h->m.fam[f].ntags > ndim[it] || ndim[ib] != 3) {
+            set_err(h, "arctag_meta.json: span family %s does not match the outputs of %s", h->m.fam[f].name, h->model_path);
+            nat_close(nm); return -1;
+        }
+    }
+    close_native(h);
+    h->nm = nm; h->ntotal = o;
+    memcpy(h->noff, noff, sizeof noff); memcpy(h->ndim, ndim, sizeof ndim);
+    return 0;
+}
+
+/* (re)load the model for the current backend, precision and file; the old one stays in use if this fails */
+static int open_session(arctag_t *h) {
+    if (h->backend == ARCTAG_BACKEND_ONNXRUNTIME) {
+#ifdef ARCTAG_WITH_ORT
+        if (open_ort(h)) return -1;
+        close_native(h);
+        return 0;
+#else
+        set_err(h, "this build of arctag has no ONNX Runtime backend (configure with -DARCTAG_WITH_ORT=ON)");
+        return -1;
+#endif
+    }
+    if (open_native(h)) return -1;
+#ifdef ARCTAG_WITH_ORT
+    close_ort(h);
+#endif
+    return 0;
 }
 
 arctag_t *arctag_create_ex(const char *model_dir, const arctag_options *opt, char *err, size_t errlen) {
     arctag_t *h = (arctag_t *)calloc(1, sizeof(arctag_t));
     if (!h) { if (err && errlen) snprintf(err, errlen, "out of memory"); return NULL; }
-    const OrtApiBase *base = OrtGetApiBase();
-    h->ort = base ? base->GetApi(ORT_API_VERSION) : NULL;
     char *p;
     if (!model_dir) model_dir = "model";
-    if (!h->ort) { set_err(h, "onnxruntime: API version %d not supported by the loaded library", ORT_API_VERSION); goto fail; }
     p = path_join(model_dir, "arctag_meta.json");
     if (load_meta(h, p)) { free(p); goto fail; }
     free(p);
@@ -1067,13 +1303,17 @@ arctag_t *arctag_create_ex(const char *model_dir, const arctag_options *opt, cha
     if (opt && opt->size >= offsetof(arctag_options, precision) + sizeof opt->precision) h->precision = opt->precision == ARCTAG_INT8 ? ARCTAG_INT8 : ARCTAG_FP32;
     if (opt && opt->size >= offsetof(arctag_options, threads) + sizeof opt->threads && opt->threads > 0) h->threads = opt->threads;
     if (opt && opt->size >= offsetof(arctag_options, model_file) + sizeof opt->model_file && opt->model_file) h->model_file = xstrdup(opt->model_file);
+    h->backend = ARCTAG_BACKEND_NATIVE; h->stream_state = 1;
+    { const char *t = getenv("ARCTAG_BACKEND"); int b = t ? backend_of(t) : -1; if (b > 0) h->backend = b; }
+    if (opt && opt->size >= offsetof(arctag_options, backend) + sizeof opt->backend && opt->backend != ARCTAG_BACKEND_DEFAULT) {
+        if (opt->backend != ARCTAG_BACKEND_NATIVE && opt->backend != ARCTAG_BACKEND_ONNXRUNTIME) { set_err(h, "unknown backend %d", (int)opt->backend); goto fail; }
+        h->backend = opt->backend;
+    }
     for (int q = 0; q < NQ; q++) { h->qo[q] = h->nout; h->out_names[h->nout++] = xstrdup(QN[q]); }
     for (int f = 0; f < h->m.nfam; f++) { h->out_names[h->nout++] = xstrdup(h->m.fam[f].out_t); h->out_names[h->nout++] = xstrdup(h->m.fam[f].out_b); }
     h->out_names[h->nout++] = xstrdup("ver_m"); h->out_names[h->nout++] = xstrdup("ver_e");
     h->model_dir = xstrdup(model_dir);
     set_model_path(h);
-    ORT_CHECK(h, h->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "arctag", &h->env));
-    ORT_CHECK(h, h->ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &h->mem));
     if (open_session(h)) goto fail;
     h->err[0] = 0;
     return h;
@@ -1090,6 +1330,7 @@ void arctag_reset(arctag_t *h) {
     for (int i = 0; i < h->n; i++) word_free(&h->words[i]);
     h->n = 0; h->nb = 0; h->np = 0; h->nk = 0; h->lo = 0;
     h->fine_chk = -1;
+    stream_invalidate(h);
     if (h->m.prof && h->prof != h->base_prof) use_profile(h, h->base_prof);
 }
 
@@ -1097,9 +1338,10 @@ void arctag_destroy(arctag_t *h) {
     if (!h) return;
     arctag_reset(h);
     free(h->words); free(h->bounds); free(h->pend); free(h->keys);
-    if (h->sess) h->ort->ReleaseSession(h->sess);
-    if (h->mem) h->ort->ReleaseMemoryInfo(h->mem);
-    if (h->env) h->ort->ReleaseEnv(h->env);
+#ifdef ARCTAG_WITH_ORT
+    close_ort(h);
+#endif
+    close_native(h);
     for (int i = 0; i < h->nout; i++) free(h->out_names[i]);
     for (int q = 0; q < NQ; q++) free(h->thr[q]);
     for (int i = 0; i < h->nov; i++) free(h->ov[i].pat);
@@ -1207,9 +1449,31 @@ int arctag_set_option(arctag_t *h, const char *key, const char *value) {
         free(oldf);
         return 0;
     }
-    if (!strcmp(key, "threads")) { int t = atoi(value); if (t < 0) { set_err(h, "threads must be >= 0"); return -1; } if (t == h->threads && h->sess) return 0; h->threads = t; return open_session(h); }
+    if (!strcmp(key, "threads")) {
+        int t = atoi(value);
+        if (t < 0) { set_err(h, "threads must be >= 0"); return -1; }
+        if (t == h->threads || h->backend == ARCTAG_BACKEND_NATIVE) { h->threads = t; return 0; }   /* native: one thread */
+        int old = h->threads; h->threads = t;
+        if (open_session(h)) { h->threads = old; return -1; }
+        return 0;
+    }
+    if (!strcmp(key, "backend")) {
+        int b = backend_of(value);
+        if (b < 0) { set_err(h, "backend must be native or onnxruntime"); return -1; }
+        if (b == h->backend) return 0;
+        int old = h->backend; h->backend = b;
+        if (open_session(h)) { h->backend = old; return -1; }
+        return 0;
+    }
+    if (!strcmp(key, "stream_state")) {
+        if (!strcmp(value, "on") || !strcmp(value, "1") || !strcmp(value, "true")) h->stream_state = 1;
+        else if (!strcmp(value, "off") || !strcmp(value, "0") || !strcmp(value, "false")) h->stream_state = 0;
+        else { set_err(h, "stream_state must be on or off"); return -1; }
+        stream_invalidate(h);
+        return 0;
+    }
     if (!strcmp(key, "max_ctx")) { int v = atoi(value); if (v < 16 || v > 2048) { set_err(h, "max_ctx must be 16..2048"); return -1; } h->max_ctx = v; return 0; }
-    if (!strcmp(key, "stream_ctx")) { int v = atoi(value); if (v < 16 || v > 2048) { set_err(h, "stream_ctx must be 16..2048"); return -1; } h->stream_ctx = v; return 0; }
+    if (!strcmp(key, "stream_ctx")) { int v = atoi(value); if (v < 16 || v > 2048) { set_err(h, "stream_ctx must be 16..2048"); return -1; } if (v != h->stream_ctx) stream_invalidate(h); h->stream_ctx = v; return 0; }
     if (!strcmp(key, "fine_auto")) {
         if (!strcmp(value, "on") || !strcmp(value, "1") || !strcmp(value, "true")) h->fine_auto = 1;
         else if (!strcmp(value, "off") || !strcmp(value, "0") || !strcmp(value, "false")) h->fine_auto = 0;
@@ -1251,13 +1515,13 @@ static int apply_config_obj(arctag_t *h, cJSON *j) {
     for (cJSON *x = j->child; x; x = x->next) {
         const char *k = x->string; int rc = 0;
         if (is_info_key(k)) continue;
-        if (!strcmp(k, "domain") || !strcmp(k, "asr") || !strcmp(k, "precision")) {
+        if (!strcmp(k, "domain") || !strcmp(k, "asr") || !strcmp(k, "precision") || !strcmp(k, "backend")) {
             if (!cJSON_IsString(x)) { set_err(h, "config: %s must be a string", k); return -1; }
             rc = arctag_set_option(h, k, x->valuestring);
         } else if (!strcmp(k, "threads") || !strcmp(k, "max_ctx") || !strcmp(k, "stream_ctx")) {
             if (!cJSON_IsNumber(x)) { set_err(h, "config: %s must be a number", k); return -1; }
             snprintf(b, sizeof b, "%d", x->valueint); rc = arctag_set_option(h, k, b);
-        } else if (!strcmp(k, "fine_auto")) {
+        } else if (!strcmp(k, "fine_auto") || !strcmp(k, "stream_state")) {
             rc = arctag_set_option(h, k, cJSON_IsTrue(x) ? "on" : "off");
         } else if (!strcmp(k, "emit") || !strcmp(k, "tags")) {
             if (!cJSON_IsArray(x)) { set_err(h, "config: %s must be an array of strings", k); return -1; }
@@ -1306,6 +1570,8 @@ arctag_t *arctag_create_from_config(const char *model_dir, const char *config_pa
     const char *pr = S_(j, "precision");
     if (!strcmp(pr, "int8")) o.precision = ARCTAG_INT8;
     cJSON *th = cJSON_GetObjectItem(j, "threads"); if (cJSON_IsNumber(th)) o.threads = th->valueint;
+    const char *be = S_(j, "backend");
+    if (*be) { int b = backend_of(be); if (b < 0) { if (err && errlen) snprintf(err, errlen, "config %s: backend must be native or onnxruntime", config_path); cJSON_Delete(j); return NULL; } o.backend = (arctag_backend_t)b; }
     char *md = NULL;
     if (!model_dir) {
         const char *rel = S_(j, "model_dir");
@@ -1334,6 +1600,12 @@ char *arctag_info(arctag_t *h) {
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "version", ARCTAG_VERSION);
     cJSON_AddStringToObject(o, "precision", h->precision == ARCTAG_INT8 ? "int8" : "fp32");
+    cJSON_AddStringToObject(o, "backend", backend_name(h->backend));
+    if (h->backend == ARCTAG_BACKEND_NATIVE && h->nm) {
+        cJSON_AddStringToObject(o, "weights", nat_weights_kind(h->nm));
+        cJSON_AddStringToObject(o, "kernels", nat_simd_name());
+        cJSON_AddBoolToObject(o, "stream_state", h->stream_state);
+    }
     cJSON_AddStringToObject(o, "model_file", h->model_path);
     cJSON_AddStringToObject(o, "profile", h->m.prof[h->prof].name);
     cJSON_AddStringToObject(o, "asr", h->m.asr[h->asr]);
@@ -1544,6 +1816,7 @@ int arctag_push_words(arctag_t *h, const char *words_json) {
         h->np = k;
     }
     if (from < h->lo) h->lo = from;
+    if (from < h->sdirty) h->sdirty = from;                         /* native stream: words from here on changed */
     for (cJSON *x = arr ? arr->child : NULL; x; x = x->next) {
         if (h->n == h->cap) { h->cap = h->cap ? 2 * h->cap : 256; h->words = (word_t *)realloc(h->words, sizeof(word_t) * (size_t)h->cap); }
         int eou;
@@ -1574,7 +1847,7 @@ char *arctag_poll(arctag_t *h) {
     us[0] = 1;
     for (int b = 0; b < h->nb; b++) if (h->bounds[b] >= s && h->bounds[b] < n) us[h->bounds[b] - s] = 1;
     run_t r, r2;
-    if (run_model(h, h->words, n, s, n, us, &r)) { free(us); cJSON_Delete(res); return NULL; }
+    if (run_stream(h, s, n, us, &r)) { free(us); cJSON_Delete(res); return NULL; }
     /* utterances closed since the last poll: read with the profile they were spoken under */
     cJSON *utts = cJSON_CreateArray();
     for (int i = 0; i < h->np; i++) {
@@ -1602,8 +1875,9 @@ char *arctag_poll(arctag_t *h) {
         if (p >= 0 && p != h->prof) {
             decode_events(h, &r, lo - s, W, s, h->words, evs);
             use_profile(h, p);
-            if (run_model(h, h->words, n, s, n, us, &r2)) { run_free(h, &r); free(us); cJSON_Delete(utts); cJSON_Delete(evs); cJSON_Delete(res); return NULL; }
-            run_free(h, &r); r = r2; lo = s;
+            run_free(h, &r);
+            if (run_stream(h, s, n, us, &r2)) { free(us); cJSON_Delete(utts); cJSON_Delete(evs); cJSON_Delete(res); return NULL; }
+            r = r2; lo = s;
             cJSON_SetValuestring(prof, h->m.prof[h->prof].name);
         }
     }
