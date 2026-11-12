@@ -31,22 +31,31 @@ typedef struct arctag arctag_t;
 /* Model precision: which ONNX graph of the model directory is loaded. */
 typedef enum {
     ARCTAG_FP32 = 0,   /* arctag.onnx (reference accuracy) */
-    ARCTAG_INT8 = 1    /* arctag_int8.onnx (dynamic int8 weights: smaller, faster load, close to fp32; see docs/int8.md) */
+    ARCTAG_INT8 = 1    /* arctag_int8.onnx (int8 weights: smaller file, close to fp32; see docs/int8.md) */
 } arctag_precision_t;
+
+/* What runs the model. Both read the same model files and give the same output (see README, "Backends"). */
+typedef enum {
+    ARCTAG_BACKEND_DEFAULT = 0,       /* $ARCTAG_BACKEND if set, else native */
+    ARCTAG_BACKEND_NATIVE = 1,        /* plain C, one thread; streaming polls only compute new words */
+    ARCTAG_BACKEND_ONNXRUNTIME = 2    /* ONNX Runtime (builds with ARCTAG_WITH_ORT, the default) */
+} arctag_backend_t;
 
 /* Load-time options for arctag_create_ex. Always initialise with arctag_options_init() first, then set fields:
  * new fields are only ever appended, and `size` tells the library which ones the caller knows about. */
 typedef struct arctag_options {
     size_t size;                    /* = sizeof(arctag_options), set by arctag_options_init */
     arctag_precision_t precision;   /* ARCTAG_FP32 (default) or ARCTAG_INT8 */
-    int threads;                    /* ONNX Runtime intra-op threads; 0 = $ARCTAG_THREADS or the ORT default */
+    int threads;                    /* ONNX Runtime intra-op threads; 0 = $ARCTAG_THREADS or the ORT default (native: always 1) */
     const char *model_file;         /* optional ONNX file (name inside model_dir, or a path) instead of the precision's default */
+    arctag_backend_t backend;       /* ARCTAG_BACKEND_DEFAULT (native unless $ARCTAG_BACKEND says otherwise) */
 } arctag_options;
 
 ARCTAG_API void arctag_options_init(arctag_options *opt);
 
 /* Load a model directory containing arctag.onnx (and/or arctag_int8.onnx), arctag_meta.json and tokenizer.json.
- * arctag_create uses fp32 unless $ARCTAG_PRECISION=int8. Returns NULL on failure and writes a message into err. */
+ * arctag_create uses fp32 unless $ARCTAG_PRECISION=int8, and the native backend unless $ARCTAG_BACKEND=onnxruntime.
+ * Returns NULL on failure and writes a message into err. */
 ARCTAG_API arctag_t *arctag_create(const char *model_dir, char *err, size_t errlen);
 ARCTAG_API arctag_t *arctag_create_ex(const char *model_dir, const arctag_options *opt, char *err, size_t errlen);
 
@@ -62,10 +71,13 @@ ARCTAG_API int arctag_apply_config(arctag_t *h, const char *config_json);
  *   "domain"     profile: auto (default) | talk | meeting | court | assistant | sports | news, or a fine domain
  *                (nba nhl nfl soccer cricket court_appellate court_trial assistant_noisy stream_chat), or "ui:fine"
  *   "asr"        word source the text comes from (names in arctag_meta.json "asr_sources"; default "unknown")
- *   "precision"  fp32 | int8 (reloads the ONNX session)
- *   "threads"    ONNX Runtime intra-op threads (0 = ORT default; reloads the session)
+ *   "backend"    native | onnxruntime (reloads the model)
+ *   "precision"  fp32 | int8 (reloads the model)
+ *   "threads"    ONNX Runtime intra-op threads (0 = ORT default; reloads the session). The native backend uses one thread.
  *   "max_ctx"    words per model pass for arctag_tag_text (default 2048 = the model's context limit)
- *   "stream_ctx" words of context re-run by arctag_poll (default 256)
+ *   "stream_ctx" words of context arctag_poll looks back at (default 256)
+ *   "stream_state" on | off (native backend; default on): keep the model state between polls so a poll only computes
+ *                the new words. off = re-run the last stream_ctx words on every poll, as the onnxruntime backend does.
  *   "fine_auto"  on | off: pick the fine domain inside sports / court from lexicon cues (default on)
  *   "emit"       comma list of output sections (default all): entity number pii profanity toxicity events intent act
  *                safety emotion arousal valence intensity role item state
@@ -96,7 +108,8 @@ ARCTAG_API char *arctag_tag_words(arctag_t *h, const char *words_json);
  * Returns 0 on success, -1 on a parse error. */
 ARCTAG_API int arctag_push_words(arctag_t *h, const char *words_json);
 
-/* Run the model over the newest stream_ctx words and return what changed:
+/* Bring the model up to date with the stream (the native backend computes only the words added or revised since the last
+ * poll; the onnxruntime backend re-runs the newest stream_ctx words) and return what changed:
  * {"n_words", "a0", "profile", "spans": [spans ending after a0; replace your spans with end > a0], "events": [new events],
  *  "utterances": [read-outs of utterances closed since the last poll], "current": running read-out or null}
  * (+ "redacted_text" of words[a0:] when redaction is on). */
@@ -105,7 +118,7 @@ ARCTAG_API char *arctag_poll(arctag_t *h);
 /* Forget the stream (words, events, utterances). */
 ARCTAG_API void arctag_reset(arctag_t *h);
 
-/* Handle description: {"version","precision","model_file","profile","asr","threads","max_ctx","stream_ctx",...}. */
+/* Handle description: {"version","precision","backend","model_file","profile","asr","threads","max_ctx","stream_ctx",...}. */
 ARCTAG_API char *arctag_info(arctag_t *h);
 
 /* Last error message of this handle ("" if none). */
