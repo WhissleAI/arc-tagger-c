@@ -1,0 +1,30 @@
+{
+  "name": "meetings",
+  "use_case": "Meetings: decisions and action items",
+  "description": "Meeting transcripts (live or recorded): decision and action-item events, task assignment / scheduling / agreement intents, dialogue acts, meeting phase, people, dates, times and deadlines.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 4,
+  "mode": "batch",
+  "max_ctx": 2048,
+  "domain": "meeting",
+  "asr": "unknown",
+  "emit": [
+    "entity",
+    "number",
+    "pii",
+    "events",
+    "intent",
+    "act",
+    "role",
+    "state"
+  ],
+  "tags": [],
+  "thresholds": {
+    "event.meeting.action_item.recent": 0.35,
+    "event.meeting.decision.recent": 0.4,
+    "intent.assign_task": 0.4
+  },
+  "redact": "off",
+  "_notes": "An action item = the event word + the utterance's people / dates; the summary example in docs/USAGE.md groups them."
+}

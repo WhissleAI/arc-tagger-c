@@ -1,11 +1,13 @@
 /* arctag_server: a tiny single-threaded JSON server around one arctag handle (one stream).
  *
- *   arctag_server -m MODEL_DIR --stdin            JSON lines on stdin -> one JSON line per request on stdout
+ *   arctag_server [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-t THREADS] [-d DOMAIN] (--stdin | --port N [--host ADDR])
+ *   --stdin: JSON lines on stdin -> one JSON line per request on stdout
  *        {"op":"tag","text":"..."}  {"op":"tag_words","words":[...]}  {"op":"push","words":[...],"from":k,"endpoint":true}
- *        {"op":"poll"}  {"op":"reset"}  {"op":"set","key":"domain","value":"meeting"}
- *   arctag_server -m MODEL_DIR --port 8090        HTTP on 127.0.0.1 (use --host 0.0.0.0 to listen on all interfaces)
+ *        {"op":"poll"}  {"op":"reset"}  {"op":"set","key":"domain","value":"meeting"}  {"op":"config","config":{...}}  {"op":"info"}
+ *   --port: HTTP on 127.0.0.1 (use --host 0.0.0.0 to listen on all interfaces)
  *        POST /tag    body: raw text, or {"text": "...", "domain": "..."}
- *        POST /push   body: the arctag_push_words JSON        POST|GET /poll        POST /reset        GET /health
+ *        POST /push   body: the arctag_push_words JSON        POST|GET /poll        POST /reset
+ *        POST /config body: a config object (configs/NAME.json keys)                GET /info          GET /health
  */
 #include "arctag.h"
 #include "cJSON.h"
@@ -57,12 +59,18 @@ static char *handle(arctag_t *h, cJSON *req) {
     }
     if (!strcmp(o, "poll")) { char *r = arctag_poll(h); return r ? r : err_json(arctag_last_error(h)); }
     if (!strcmp(o, "reset")) { arctag_reset(h); return strdup("{\"ok\":true}"); }
+    if (!strcmp(o, "info")) return arctag_info(h);
+    if (!strcmp(o, "config")) {
+        char *c = cJSON_PrintUnformatted(cJSON_GetObjectItem(req, "config"));
+        int rc = c ? arctag_apply_config(h, c) : -1; free(c);
+        return rc ? err_json(c ? arctag_last_error(h) : "missing config object") : arctag_info(h);
+    }
     if (!strcmp(o, "set")) {
         cJSON *k = cJSON_GetObjectItem(req, "key"), *v = cJSON_GetObjectItem(req, "value");
         if (!cJSON_IsString(k) || !cJSON_IsString(v)) return err_json("set needs key and value strings");
         return arctag_set_option(h, k->valuestring, v->valuestring) ? err_json(arctag_last_error(h)) : strdup("{\"ok\":true}");
     }
-    return err_json("unknown op (tag | tag_words | push | poll | reset | set)");
+    return err_json("unknown op (tag | tag_words | push | poll | reset | set | config | info)");
 }
 
 static int run_stdin(arctag_t *h) {
@@ -139,7 +147,13 @@ static int run_http(arctag_t *h, const char *host, int port) {
             if (req) cJSON_AddStringToObject(req, "op", "push");
         } else if (!strcmp(path, "/poll")) { req = cJSON_CreateObject(); cJSON_AddStringToObject(req, "op", "poll"); }
         else if (!strcmp(path, "/reset")) { req = cJSON_CreateObject(); cJSON_AddStringToObject(req, "op", "reset"); }
-        else { code = 404; out = err_json("endpoints: POST /tag, POST /push, GET /poll, POST /reset, GET /health"); }
+        else if (!strcmp(path, "/info")) { req = cJSON_CreateObject(); cJSON_AddStringToObject(req, "op", "info"); }
+        else if (!strcmp(path, "/config")) {
+            cJSON *c = cJSON_Parse(body);
+            if (cJSON_IsObject(c)) { req = cJSON_CreateObject(); cJSON_AddItemToObject(req, "config", c); cJSON_AddStringToObject(req, "op", "config"); }
+            else cJSON_Delete(c);
+        }
+        else { code = 404; out = err_json("endpoints: POST /tag, POST /push, GET /poll, POST /reset, POST /config, GET /info, GET /health"); }
         if (!out) {
             if (req) { out = handle(h, req); if (!strncmp(out, "{\"error\"", 8)) code = 400; }
             else { code = 400; out = err_json("invalid JSON body"); }
@@ -153,21 +167,33 @@ static int run_http(arctag_t *h, const char *host, int port) {
 }
 
 int main(int argc, char **argv) {
-    const char *model = getenv("ARCTAG_MODEL_DIR"), *host = "127.0.0.1", *domain = NULL;
-    int port = 0, use_stdin = 0;
-    if (!model) model = "model";
+    const char *model = getenv("ARCTAG_MODEL_DIR"), *host = "127.0.0.1", *domain = NULL, *config = NULL, *threads = NULL;
+    int port = 0, use_stdin = 0, precision = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) config = argv[++i];
+        else if (!strcmp(argv[i], "--int8")) precision = ARCTAG_INT8;
+        else if (!strcmp(argv[i], "--fp32")) precision = ARCTAG_FP32;
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) threads = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) domain = argv[++i];
         else if (!strcmp(argv[i], "--stdin")) use_stdin = 1;
-        else { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-d DOMAIN] (--stdin | --port N [--host ADDR])\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [-m MODEL_DIR] [-c CONFIG.json] [--int8] [-t THREADS] [-d DOMAIN] (--stdin | --port N [--host ADDR])\n", argv[0]); return 2; }
     }
     char err[512];
-    arctag_t *h = arctag_create(model, err, sizeof err);
-    if (!h) { fprintf(stderr, "arctag_create(%s): %s\n", model, err); return 1; }
-    if (domain && arctag_set_option(h, "domain", domain)) { fprintf(stderr, "%s\n", arctag_last_error(h)); return 1; }
+    arctag_t *h;
+    if (config) h = arctag_create_from_config(model, config, err, sizeof err);
+    else {
+        arctag_options o; arctag_options_init(&o);
+        if (precision >= 0) o.precision = (arctag_precision_t)precision;
+        h = arctag_create_ex(model ? model : "model", &o, err, sizeof err);
+    }
+    if (!h) { fprintf(stderr, "arctag_create(%s): %s\n", model ? model : "model", err); return 1; }
+    if ((config && precision >= 0 && arctag_set_option(h, "precision", precision == ARCTAG_INT8 ? "int8" : "fp32")) ||
+        (threads && arctag_set_option(h, "threads", threads)) || (domain && arctag_set_option(h, "domain", domain))) {
+        fprintf(stderr, "%s\n", arctag_last_error(h)); arctag_destroy(h); return 1;
+    }
     int rc = (port > 0 && !use_stdin) ? run_http(h, host, port) : run_stdin(h);
     arctag_destroy(h);
     return rc;

@@ -1,0 +1,33 @@
+{
+  "name": "sports",
+  "use_case": "Sports media: live commentary",
+  "description": "Play-by-play and studio commentary: score / clock / stat / jersey numbers, teams and players, scoring and game events (score, touchdown, wicket, turnover, foul, substitution, ...), game state and broadcast mode. Masks on-air profanity.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 2,
+  "mode": "streaming",
+  "stream_ctx": 256,
+  "domain": "sports",
+  "asr": "unknown",
+  "fine_auto": true,
+  "emit": [
+    "entity",
+    "number",
+    "profanity",
+    "toxicity",
+    "events",
+    "intent",
+    "state"
+  ],
+  "tags": [],
+  "thresholds": {
+    "event.sports.*": 0.5
+  },
+  "redact": {
+    "mode": "mask",
+    "policy": {
+      "profanity": "mask"
+    }
+  },
+  "_notes": "domain sports + fine_auto picks nba / nhl / nfl / soccer / cricket from the commentary vocabulary (or set the league directly)."
+}

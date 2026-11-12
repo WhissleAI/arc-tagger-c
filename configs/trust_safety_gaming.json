@@ -1,0 +1,49 @@
+{
+  "name": "trust_safety_gaming",
+  "use_case": "Trust & safety / gaming voice chat: profanity, toxicity, threats, child safety",
+  "description": "Live game / stream voice chat. Profanity and toxicity spans (insult, hate, threat, sexual, self-harm), utterance-level threat escalation, child-safety (grooming cue, inappropriate), solicitation, scam and PII-leak flags; masks profanity / toxicity / PII in the caption.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 2,
+  "mode": "streaming",
+  "stream_ctx": 128,
+  "domain": "stream_chat",
+  "asr": "unknown",
+  "emit": [
+    "profanity",
+    "toxicity",
+    "pii",
+    "entity",
+    "safety",
+    "intent",
+    "emotion",
+    "arousal",
+    "valence",
+    "intensity"
+  ],
+  "tags": [],
+  "thresholds": {
+    "safety.toxicity.threat_violence": 0.4,
+    "safety.threat.escalation": 0.35,
+    "safety.child.*": 0.3,
+    "safety.crisis.self_harm": 0.3,
+    "safety.solicitation.dating_romantic": 0.4
+  },
+  "redact": {
+    "mode": "mask",
+    "policy": {
+      "profanity": "mask",
+      "toxicity": "mask",
+      "phone": "mask",
+      "email": "mask",
+      "address": "mask",
+      "card": "mask",
+      "gov_id": "mask",
+      "dob": "mask",
+      "name": "mask",
+      "handle": "tag",
+      "contact": "tag"
+    }
+  },
+  "_notes": "stream_chat is a safety domain: toxicity spans use the 0.3 span-head floor instead of the 0.5 used elsewhere. Child-safety and self-harm flags are low-threshold review triggers (route to a human), not automatic actions."
+}
