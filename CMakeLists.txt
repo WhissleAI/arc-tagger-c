@@ -112,5 +112,20 @@ add_test(NAME example_stream_asr COMMAND stream_asr -m "${ARCTAG_MODEL_DIR}" -c 
          "${CMAKE_CURRENT_SOURCE_DIR}/examples/data/asr_stream.jsonl")
 add_test(NAME example_redact COMMAND redact -m "${ARCTAG_MODEL_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/examples/data/pii.txt")
 add_test(NAME example_batch COMMAND batch_tag -m "${ARCTAG_MODEL_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/examples/data/docs.txt")
+# web demo (demo/server.py, Python + ctypes on the shared library): smoke + timing test, skipped (77) without the
+# 'websockets' package or the model. Not under the sanitizers (an ASAN-built library cannot be loaded into a plain Python).
+if(NOT ARCTAG_SANITIZE AND (ARCTAG_SHARED OR ARCTAG_BINDINGS_LIB))
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    if(ARCTAG_SHARED)
+      set(ARCTAG_PYLIB arctag)
+    else()
+      set(ARCTAG_PYLIB arctag_shared)
+    endif()
+    add_test(NAME demo_smoke COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/demo_smoke.py"
+             --model "${ARCTAG_MODEL_DIR}" --lib $<TARGET_FILE:${ARCTAG_PYLIB}>)
+    set_tests_properties(demo_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  endif()
+endif()
 install(TARGETS ${ARCTAG_LIB_TARGETS} arctag_cli arctag_server batch_tag stream_asr redact vertical_run compare_precision bench)
 install(FILES include/arctag.h DESTINATION include)
