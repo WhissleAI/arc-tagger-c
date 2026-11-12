@@ -4,6 +4,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Model tests need the HF_TOKEN repository secret (read access to the private model repo). Optional:
+#   vars.HF_MODEL_REVISION   pin the model repo revision (default main)
+#   vars.ARCTAG_INT8_URL     where arctag_int8.onnx lives when it is not in the HF repo's onnx/ folder (+ GITHUB_TOKEN)
+# Without the int8 graph the int8 tests are reported as skipped.
+env:
+  HF_REVISION: ${{ vars.HF_MODEL_REVISION || 'main' }}
+  ARCTAG_INT8_URL: ${{ vars.ARCTAG_INT8_URL }}
+
 jobs:
   build:
     strategy:
@@ -13,22 +21,65 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Web demo dependency (demo_smoke test)
+        run: python -m pip install -r demo/requirements.txt
       - name: ONNX Runtime (prebuilt release)
         run: ./scripts/download_onnxruntime.sh
       - name: Build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE="$(command -v python)"
           cmake --build build -j 4
       - name: Smoke (no model)
-        run: ./build/arctag_cli --help
-      - name: Model tests (tokenizer + C vs Python parity; need the HF_TOKEN repository secret)
+        run: |
+          ./build/arctag_cli --help
+          python demo/server.py --help > /dev/null
+      - name: Cache model
+        uses: actions/cache@v4
+        with:
+          path: model
+          key: model-${{ env.HF_REVISION }}-${{ hashFiles('tests/expected/reference.json') }}
+      - name: Model tests (tokenizer, fp32 + int8 parity, int8 agreement, configs, examples, web demo smoke + timing)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARCTAG_THREADS: "2"
         run: |
           if [ -z "$HF_TOKEN" ]; then
             echo "HF_TOKEN secret not set: skipping the model download and the model tests"
             exit 0
           fi
-          ./scripts/fetch_model.sh
+          [ -f model/arctag.onnx ] || ./scripts/fetch_model.sh
           ctest --test-dir build --output-on-failure
+
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ONNX Runtime (prebuilt release)
+        run: ./scripts/download_onnxruntime.sh
+      - name: Build (AddressSanitizer + UBSan)
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DARCTAG_SANITIZE=ON
+          cmake --build build-asan -j 4
+      - name: Cache model
+        uses: actions/cache@v4
+        with:
+          path: model
+          key: model-${{ env.HF_REVISION }}-${{ hashFiles('tests/expected/reference.json') }}
+      - name: Tests under ASAN
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCTAG_THREADS: "2"
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          # ONNX Runtime keeps process-lifetime allocations it never frees: tests/lsan.supp suppresses those (only)
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build-asan/arctag_cli --help
+          if [ -z "$HF_TOKEN" ]; then echo "HF_TOKEN secret not set: skipping the model tests"; exit 0; fi
+          [ -f model/arctag.onnx ] || ./scripts/fetch_model.sh
+          ctest --test-dir build-asan --output-on-failure
