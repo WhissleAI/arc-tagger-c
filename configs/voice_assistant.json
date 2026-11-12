@@ -1,0 +1,27 @@
+{
+  "name": "voice_assistant",
+  "use_case": "Voice assistant: intents and slots",
+  "description": "Device-directed commands from an on-device or cloud ASR: the utterance intent (60 assistant intents + general intents), slot spans (times, dates, durations, places, people, products) and the command-complete event that tells the app when to act.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 2,
+  "mode": "streaming",
+  "stream_ctx": 128,
+  "domain": "assistant",
+  "asr": "unknown",
+  "emit": [
+    "entity",
+    "number",
+    "pii",
+    "events",
+    "intent",
+    "act",
+    "safety"
+  ],
+  "tags": [],
+  "thresholds": {
+    "safety.jailbreak.attempt": 0.45
+  },
+  "redact": "off",
+  "_notes": "Slots are the entity / number spans inside the utterance. Act on an utterance at its endpoint (or at discourse.assistant.command_complete). Intents use the assistant profile's per-intent thresholds (some intents are disabled there by the threshold fit); the jailbreak flag is lowered from 0.6 for recall, and the PII-leak flag is kept."
+}

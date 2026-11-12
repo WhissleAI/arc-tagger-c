@@ -1,0 +1,49 @@
+{
+  "name": "contact_center",
+  "use_case": "Contact center: PII redaction, agent / customer roles, scam detection",
+  "description": "Two-party calls with diarized words (spk on every word). Masks private PII in the transcript, reads agent / customer roles, intents, dialogue acts, sentiment and the scam / PII-request / escalation safety flags per utterance.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 2,
+  "mode": "streaming",
+  "stream_ctx": 256,
+  "domain": "talk",
+  "asr": "unknown",
+  "emit": [
+    "pii",
+    "entity",
+    "number",
+    "profanity",
+    "toxicity",
+    "events",
+    "intent",
+    "act",
+    "safety",
+    "emotion",
+    "valence",
+    "role"
+  ],
+  "tags": [],
+  "thresholds": {
+    "safety.scam.*": 0.4,
+    "safety.pii.request": 0.45,
+    "safety.threat.escalation": 0.4
+  },
+  "redact": {
+    "mode": "mask",
+    "policy": {
+      "phone": "mask",
+      "email": "mask",
+      "address": "mask",
+      "card": "mask",
+      "gov_id": "mask",
+      "dob": "mask",
+      "name": "mask",
+      "handle": "mask",
+      "contact": "tag",
+      "profanity": "mask",
+      "toxicity": "tag"
+    }
+  },
+  "_notes": "Roles (speaker.role.agent / customer) need speaker ids on the words. PII spans already use the recall-leaning span-head floor (0.3); the scam / PII-request / escalation flags are alerts, so they are lowered from the talk profile's 0.5-0.6 to lean to recall."
+}

@@ -1,0 +1,31 @@
+{
+  "name": "legal",
+  "use_case": "Legal / court: legal references, objections and rulings",
+  "description": "Court hearings and depositions: legal-reference spans (statutes, rules, cases), people / organisations / dates, the objection / sustained / overruled events, court roles (judge, counsel, witness), the legal phase and case area.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 4,
+  "mode": "batch",
+  "max_ctx": 2048,
+  "domain": "court_trial",
+  "asr": "unknown",
+  "fine_auto": true,
+  "emit": [
+    "entity",
+    "number",
+    "pii",
+    "events",
+    "intent",
+    "act",
+    "role",
+    "item",
+    "state"
+  ],
+  "tags": [],
+  "thresholds": {
+    "event.legal.*": 0.4,
+    "entity.mention.legal_ref": 0.5
+  },
+  "redact": "off",
+  "_notes": "court_trial is the profile where the objection / sustained / overruled events are valid (court_appellate has none); fine_auto switches to court_appellate on appellate vocabulary - set fine_auto false to pin court_trial."
+}

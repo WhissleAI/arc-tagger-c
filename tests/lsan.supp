@@ -1,0 +1,2 @@
+# LeakSanitizer suppressions: ONNX Runtime keeps process-lifetime allocations (thread pool / environment) that it never frees
+leak:libonnxruntime

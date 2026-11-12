@@ -1,0 +1,22 @@
+{
+  "name": "pii_redaction",
+  "use_case": "Generic PII redaction",
+  "description": "Domain-agnostic redaction of transcripts or text: masks private names, phone numbers, emails, street addresses, card / account numbers, government ids, dates of birth and handles; public contacts (a business phone line) stay.",
+  "model_dir": "../model",
+  "precision": "fp32",
+  "threads": 4,
+  "mode": "batch",
+  "max_ctx": 2048,
+  "domain": "auto",
+  "asr": "unknown",
+  "emit": [
+    "pii",
+    "safety"
+  ],
+  "tags": [
+    "safety.pii."
+  ],
+  "thresholds": {},
+  "redact": "mask",
+  "_notes": "The PII span head already runs at the 0.3 display floor (recall-leaning), so no overrides are needed; raise head:safety.pii for fewer false masks. Read redacted_text from the result."
+}
