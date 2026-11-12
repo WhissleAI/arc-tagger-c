@@ -1,10 +1,11 @@
-/* arctag: Arc Tagger C library (ONNX Runtime C API). Decoding = the Arc Tagger demo engine's T0 path (see README). */
+/* arctag: Arc Tagger C library (ONNX Runtime C API). Decoding: the T0 (zero-lag) tier of Arc Tagger (see README). */
 #include "arctag.h"
 #include "tokenizer.h"
 #include "cJSON.h"
 #include <onnxruntime_c_api.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,12 +14,14 @@
 #include <windows.h>
 #endif
 
-#define ARCTAG_VERSION "0.1.0"
+#define ARCTAG_VERSION "0.3.0"
 #define NQ 10
 #define P_MAX 8
 #define NFEAT 8
 #define MAX_FAM 8
 #define MAX_OUT 32
+#define MAX_SEG 16
+#define N_RCAT 11
 
 static const char *QN[NQ] = {"frame", "span_beg", "span_in", "span_end", "ev_at", "ev_imm", "ev_rec", "utt", "speaker", "item"};
 enum { Q_FRAME, Q_BEG, Q_IN, Q_END, Q_EVAT, Q_EVIMM, Q_EVREC, Q_UTT, Q_SPK, Q_ITEM };
@@ -29,8 +32,9 @@ static double r6(double x) { return round(x * 1e6) / 1e6; }
 static int starts_with(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
 
 /* ------------------------------------------------------------------ model metadata */
-typedef struct { char *name; int dom; double *thr[NQ]; unsigned char *valid[NQ]; double head_thr[MAX_FAM]; } profile_t;
+typedef struct { char *name, *ui, *fine; int dom; double *thr[NQ]; unsigned char *valid[NQ]; double head_thr[MAX_FAM]; } profile_t;
 typedef struct { char *name, *out_t, *out_b; int ntags; char **tags; int use; } fam_t;
+typedef struct { char *ui; int ncue; int *ntok; char *(*tok)[3]; int *fine; int nfine; char **fines; } cues_t;   /* fine-domain lexicon cues */
 
 typedef struct {
     int nc[NQ]; char **cols[NQ];
@@ -43,6 +47,8 @@ typedef struct {
     double gap_e[16], dur_e[16], conf_e[16]; int n_gap, n_dur, n_conf;
     int nasr; char **asr; int default_asr;
     int max_ctx, span_win;
+    unsigned char *ev_skip[NQ];           /* event columns not displayed at T0 (hidden, or another display tier) */
+    int ncues; cues_t *cues; int fine_min, fine_every; double fine_ratio;
 } meta_t;
 
 /* ------------------------------------------------------------------ words / stream */
@@ -52,12 +58,27 @@ typedef struct {
 } word_t;
 
 typedef struct { int q, c, i; } evkey_t;
+typedef struct { char *pat; int q; double v; } thr_ov_t;      /* threshold override; q = -1: every read-out, -2: head family */
+
+/* output sections (option "emit") */
+enum { E_ENTITY, E_NUMBER, E_PII, E_PROF, E_TOX, E_EVENTS, E_INTENT, E_ACT, E_SAFETY, E_EMOTION, E_AROUSAL, E_VALENCE, E_INTENSITY,
+       E_ROLE, E_ITEM, E_STATE, N_EMIT };
+static const char *EMIT_N[N_EMIT] = {"entity", "number", "pii", "profanity", "toxicity", "events", "intent", "act", "safety", "emotion",
+                                     "arousal", "valence", "intensity", "role", "item", "state"};
+/* redaction categories */
+static const char *RCAT[N_RCAT] = {"phone", "email", "address", "card", "gov_id", "dob", "name", "handle", "contact", "profanity", "toxicity"};
+static const char *RLAB[N_RCAT] = {"PHONE", "EMAIL", "ADDRESS", "CARD", "GOV_ID", "DOB", "NAME", "HANDLE", "CONTACT", "PROFANITY", "TOXIC"};
 
 struct arctag {
     const OrtApi *ort; OrtEnv *env; OrtSession *sess; OrtMemoryInfo *mem;
-    char *model_path; int threads;
+    char *model_dir, *model_path, *model_file; int threads, precision;
     meta_t m; arctok_t *tok;
-    int prof, asr, max_ctx, stream_ctx;
+    int prof, base_prof, asr, max_ctx, stream_ctx;
+    double *thr[NQ]; double head[MAX_FAM];   /* thresholds of the active profile with the overrides applied */
+    thr_ov_t *ov; int nov;
+    int fine_auto, fine_chk;
+    unsigned char emit[N_EMIT]; int all_emit; char **tagpre; int ntagpre;
+    int redact; unsigned char rpol[N_RCAT];  /* redact: 0 off, 1 on; rpol: 1 = mask */
     char err[512];
     /* stream */
     word_t *words; int n, cap;
@@ -135,6 +156,8 @@ static int load_meta(arctag_t *h, const char *path) {
     m->n_dur = num_array(cJSON_GetObjectItem(j, "dur_edges"), m->dur_e, 16);
     m->n_conf = num_array(cJSON_GetObjectItem(j, "conf_edges"), m->conf_e, 16);
     m->asr = str_array(cJSON_GetObjectItem(j, "asr_sources"), &m->nasr);
+    for (int i = 0; i < m->nasr; i++)                 /* human-written text: the model files call it "gold"; the API says "human" */
+        if (!strcmp(m->asr[i], "gold")) { free(m->asr[i]); m->asr[i] = xstrdup("human"); }
     cJSON *da = cJSON_GetObjectItem(j, "default_asr");
     m->default_asr = cJSON_IsString(da) ? find_str(m->asr, m->nasr, da->valuestring) : 0;
     if (m->default_asr < 0) m->default_asr = 0;
@@ -148,6 +171,8 @@ static int load_meta(arctag_t *h, const char *path) {
         profile_t *P = &m->prof[pi];
         P->name = xstrdup(p->string);
         P->dom = cJSON_GetObjectItem(p, "dom")->valueint;
+        cJSON *ui = cJSON_GetObjectItem(p, "ui"), *fi = cJSON_GetObjectItem(p, "fine");
+        P->ui = xstrdup(cJSON_IsString(ui) ? ui->valuestring : ""); P->fine = xstrdup(cJSON_IsString(fi) ? fi->valuestring : "");
         cJSON *th = cJSON_GetObjectItem(p, "thr"), *va = cJSON_GetObjectItem(p, "valid"), *ht = cJSON_GetObjectItem(p, "head_thr");
         for (int q = 0; q < NQ; q++) {
             P->thr[q] = (double *)calloc((size_t)m->nc[q] + 1, sizeof(double));
@@ -175,6 +200,50 @@ static int load_meta(arctag_t *h, const char *path) {
     cJSON *dp = cJSON_GetObjectItem(j, "default_profile");
     m->default_prof = 0;
     for (int p = 0; p < m->nprof; p++) if (cJSON_IsString(dp) && !strcmp(m->prof[p].name, dp->valuestring)) m->default_prof = p;
+    /* events not displayed at T0: hidden ones and those whose display tier is another tier */
+    cJSON *ev = cJSON_GetObjectItem(j, "events"), *evt = cJSON_GetObjectItem(ev, "tier"), *evh = cJSON_GetObjectItem(ev, "hide");
+    for (int q = 0; q < NQ; q++) {
+        m->ev_skip[q] = (unsigned char *)calloc((size_t)m->nc[q] + 1, 1);
+        for (int c = 0; c < m->nc[q]; c++) {
+            cJSON *t = cJSON_GetObjectItem(evt, m->cols[q][c]);
+            if (cJSON_IsString(t) && strcmp(t->valuestring, "T0")) m->ev_skip[q][c] = 1;
+            for (cJSON *hx = evh ? evh->child : NULL; hx; hx = hx->next) if (cJSON_IsString(hx) && !strcmp(hx->valuestring, m->cols[q][c])) m->ev_skip[q][c] = 1;
+        }
+    }
+    /* fine-domain lexicon cues {ui: {fine: ["cue", "two-word-cue", ...]}} */
+    cJSON *fc = cJSON_GetObjectItem(j, "fine_cues");
+    m->ncues = cJSON_GetArraySize(fc);
+    m->cues = (cues_t *)calloc((size_t)m->ncues + 1, sizeof(cues_t));
+    int ci = 0;
+    for (cJSON *u = fc ? fc->child : NULL; u; u = u->next, ci++) {
+        cues_t *C = &m->cues[ci]; C->ui = xstrdup(u->string);
+        int tot = 0; C->nfine = cJSON_GetArraySize(u);
+        for (cJSON *f = u->child; f; f = f->next) tot += cJSON_GetArraySize(f);
+        C->ntok = (int *)calloc((size_t)tot + 1, sizeof(int)); C->tok = (char *(*)[3])calloc((size_t)tot + 1, sizeof *C->tok);
+        C->fine = (int *)calloc((size_t)tot + 1, sizeof(int)); C->fines = (char **)calloc((size_t)C->nfine + 1, sizeof(char *));
+        int fi = 0;
+        for (cJSON *f = u->child; f; f = f->next, fi++) {
+            C->fines[fi] = xstrdup(f->string);
+            for (cJSON *c = f->child; c; c = c->next) {
+                if (!cJSON_IsString(c)) continue;
+                char *t[3] = {0}; int nt = 0; char buf[128]; snprintf(buf, sizeof buf, "%s", c->valuestring);
+                for (char *x = buf; *x; x++) if (*x == '-') *x = ' ';
+                for (char *x = strtok(buf, " "); x && nt < 3; x = strtok(NULL, " ")) t[nt++] = xstrdup(x);
+                int dup = -1;                                        /* python dict: a later fine overwrites the same cue */
+                for (int k = 0; k < C->ncue && dup < 0; k++) {
+                    if (C->ntok[k] != nt) continue;
+                    int same = 1; for (int z = 0; z < nt; z++) if (strcmp(C->tok[k][z], t[z])) same = 0;
+                    if (same) dup = k;
+                }
+                if (dup >= 0) { C->fine[dup] = fi; for (int z = 0; z < nt; z++) free(t[z]); continue; }
+                C->ntok[C->ncue] = nt; for (int z = 0; z < 3; z++) C->tok[C->ncue][z] = t[z];
+                C->fine[C->ncue++] = fi;
+            }
+        }
+    }
+    x = cJSON_GetObjectItem(j, "fine_min"); m->fine_min = cJSON_IsNumber(x) ? x->valueint : 4;
+    x = cJSON_GetObjectItem(j, "fine_ratio"); m->fine_ratio = cJSON_IsNumber(x) ? x->valuedouble : 2.0;
+    x = cJSON_GetObjectItem(j, "fine_every"); m->fine_every = cJSON_IsNumber(x) && x->valueint > 0 ? x->valueint : 25;
     cJSON_Delete(j);
     return 0;
 }
@@ -191,8 +260,16 @@ static void free_meta(meta_t *m) {
     free(m->state_groups);
     for (int i = 0; i < m->nasr; i++) free(m->asr[i]);
     free(m->asr);
+    for (int q = 0; q < NQ; q++) free(m->ev_skip[q]);
+    for (int i = 0; i < m->ncues; i++) {
+        cues_t *C = &m->cues[i];
+        for (int k = 0; k < C->ncue; k++) for (int z = 0; z < 3; z++) free(C->tok[k][z]);
+        for (int f = 0; f < C->nfine; f++) free(C->fines[f]);
+        free(C->ui); free(C->ntok); free(C->tok); free(C->fine); free(C->fines);
+    }
+    free(m->cues);
     for (int p = 0; p < m->nprof; p++) {
-        free(m->prof[p].name);
+        free(m->prof[p].name); free(m->prof[p].ui); free(m->prof[p].fine);
         for (int q = 0; q < NQ; q++) { free(m->prof[p].thr[q]); free(m->prof[p].valid[q]); }
     }
     free(m->prof);
@@ -200,12 +277,88 @@ static void free_meta(meta_t *m) {
     free(m->alias_k); free(m->alias_v);
 }
 
+/* ------------------------------------------------------------------ thresholds (profile + overrides) */
+static int pat_match(const char *pat, const char *tag) {
+    size_t n = strlen(pat);
+    if (n && pat[n - 1] == '*') return strncmp(tag, pat, n - 1) == 0;
+    return strcmp(tag, pat) == 0;
+}
+
+/* make profile p the active one: copy its thresholds and apply the overrides in order */
+static void use_profile(arctag_t *h, int p) {
+    const meta_t *m = &h->m; const profile_t *pf = &m->prof[p];
+    h->prof = p;
+    for (int q = 0; q < NQ; q++) {
+        if (!h->thr[q]) h->thr[q] = (double *)calloc((size_t)m->nc[q] + 1, sizeof(double));
+        memcpy(h->thr[q], pf->thr[q], sizeof(double) * (size_t)m->nc[q]);
+    }
+    for (int f = 0; f < m->nfam; f++) h->head[f] = pf->head_thr[f];
+    for (int k = 0; k < h->nov; k++) {
+        const thr_ov_t *o = &h->ov[k];
+        if (o->q == -2) { for (int f = 0; f < m->nfam; f++) if (!strcmp(m->fam[f].name, o->pat)) h->head[f] = o->v; continue; }
+        for (int q = 0; q < NQ; q++) {
+            if (o->q >= 0 && o->q != q) continue;
+            for (int c = 0; c < m->nc[q]; c++) if (pat_match(o->pat, m->cols[q][c])) h->thr[q][c] = o->v;
+        }
+        if (o->q == -1) {
+            size_t n = strlen(o->pat);
+            for (int f = 0; f < m->nfam; f++) {
+                char fp[128]; snprintf(fp, sizeof fp, "%s.", m->fam[f].name);
+                if (!strcmp(o->pat, m->fam[f].name) || (n && o->pat[n - 1] == '*' && !strncmp(fp, o->pat, n - 1))) h->head[f] = o->v;
+            }
+        }
+    }
+}
+
+static int find_profile(const meta_t *m, const char *ui, const char *fine) {
+    for (int p = 0; p < m->nprof; p++) if (!strcmp(m->prof[p].ui, ui) && !strcmp(m->prof[p].fine, fine)) return p;
+    return -1;
+}
+
+/* the fine domain the words' lexicon cues point to inside UI domain ui: profile index or -1 */
+static int fine_hint(const arctag_t *h, const char *ui, const char *const *words, int n) {
+    const meta_t *m = &h->m; const cues_t *C = NULL;
+    for (int i = 0; i < m->ncues; i++) if (!strcmp(m->cues[i].ui, ui)) C = &m->cues[i];
+    if (!C || n <= 0) return -1;
+    int a = n > 3000 ? n - 3000 : 0, W = n - a;
+    char **tk = (char **)calloc((size_t)W + 1, sizeof(char *));
+    for (int i = 0; i < W; i++) {                       /* lower-case, keep [a-z0-9] */
+        const char *w = words[a + i]; size_t L = strlen(w), k = 0;
+        tk[i] = (char *)malloc(L + 1);
+        for (size_t z = 0; z < L; z++) {
+            char c = w[z];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) tk[i][k++] = c;
+        }
+        tk[i][k] = 0;
+    }
+    int cnt[64] = {0};
+    for (int i = 0; i < W; i++)
+        for (int L = 1; L <= 3; L++) {
+            if (i + L > W) continue;
+            for (int k = 0; k < C->ncue; k++) {
+                if (C->ntok[k] != L) continue;
+                int same = 1; for (int z = 0; z < L && same; z++) if (strcmp(C->tok[k][z], tk[i + z])) same = 0;
+                if (same && C->fine[k] < 64) { cnt[C->fine[k]]++; break; }
+            }
+        }
+    for (int i = 0; i < W; i++) free(tk[i]);
+    free(tk);
+    int b1 = -1, b2 = -1;
+    for (int f = 0; f < C->nfine && f < 64; f++) {
+        if (!cnt[f]) continue;
+        if (b1 < 0 || cnt[f] > cnt[b1]) { b2 = b1; b1 = f; } else if (b2 < 0 || cnt[f] > cnt[b2]) b2 = f;
+    }
+    if (b1 < 0) return -1;
+    if (cnt[b1] >= m->fine_min && (b2 < 0 || cnt[b1] >= m->fine_ratio * cnt[b2])) return find_profile(m, ui, C->fines[b1]);
+    return -1;
+}
+
 /* ------------------------------------------------------------------ ONNX Runtime */
 #define ORT_CHECK(h, expr) do { OrtStatus *st_ = (expr); if (st_) { set_err(h, "onnxruntime: %s", (h)->ort->GetErrorMessage(st_)); (h)->ort->ReleaseStatus(st_); goto fail; } } while (0)
 
 static int open_session(arctag_t *h) {
-    OrtSessionOptions *so = NULL;
-    if (h->sess) { h->ort->ReleaseSession(h->sess); h->sess = NULL; }
+    OrtSessionOptions *so = NULL; OrtSession *ns = NULL;
     ORT_CHECK(h, h->ort->CreateSessionOptions(&so));
     ORT_CHECK(h, h->ort->SetIntraOpNumThreads(so, h->threads));
     ORT_CHECK(h, h->ort->SetInterOpNumThreads(so, 1));
@@ -215,14 +368,16 @@ static int open_session(arctag_t *h) {
         int n = MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, NULL, 0);
         wchar_t *wp = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)n);
         MultiByteToWideChar(CP_UTF8, 0, h->model_path, -1, wp, n);
-        OrtStatus *st = h->ort->CreateSession(h->env, wp, so, &h->sess);
+        OrtStatus *st = h->ort->CreateSession(h->env, wp, so, &ns);
         free(wp);
         ORT_CHECK(h, st);
     }
 #else
-    ORT_CHECK(h, h->ort->CreateSession(h->env, h->model_path, so, &h->sess));
+    ORT_CHECK(h, h->ort->CreateSession(h->env, h->model_path, so, &ns));
 #endif
     h->ort->ReleaseSessionOptions(so);
+    if (h->sess) h->ort->ReleaseSession(h->sess);       /* swap only once the new session loaded */
+    h->sess = ns;
     return 0;
 fail:
     if (so) h->ort->ReleaseSessionOptions(so);
@@ -255,7 +410,7 @@ static void digit_flags(const char *s, int *hd, int *all) {
     *hd = any; *all = any && every;
 }
 
-/* model inputs for words[a..b) (features computed sequentially from word 0 like the engine), us = utterance starts */
+/* model inputs for words[a..b) (features computed sequentially from word 0), us = utterance starts */
 static int run_model(arctag_t *h, const word_t *ws, int n_all, int a, int b, const unsigned char *us, run_t *r) {
     int W = b - a;
     memset(r, 0, sizeof *r); r->W = W;
@@ -368,7 +523,7 @@ static cJSON *top(const arctag_t *h, const run_t *r, int q, int row, const char 
     cJSON *a = cJSON_CreateArray();
     if (n_out) *n_out = 0;
     for (int i = 0; i < n && i < k; i++) {
-        int c = idx[i]; float p = P(h, r, q, row, c); double th = pf->thr[q][c];
+        int c = idx[i]; float p = P(h, r, q, row, c); double th = h->thr[q][c];
         cJSON *o = cJSON_CreateObject();
         cJSON_AddStringToObject(o, "tag", h->m.cols[q][c]);
         cJSON_AddItemToObject(o, "p", jnum(p));
@@ -424,6 +579,8 @@ static cJSON *readouts(const arctag_t *h, const run_t *r, int row, int spk_slot)
     cJSON_AddItemToObject(ro, "safety", s2);
     cJSON_AddItemToObject(ro, "emotion", top(h, r, Q_UTT, row, "affect.emotion.", 3, NULL, NULL, NULL));
     cJSON_AddItemToObject(ro, "arousal", top(h, r, Q_UTT, row, "affect.arousal.", 3, NULL, NULL, NULL));
+    cJSON_AddItemToObject(ro, "valence", top(h, r, Q_UTT, row, "affect.valence.", 3, NULL, NULL, NULL));
+    cJSON_AddItemToObject(ro, "intensity", top(h, r, Q_UTT, row, "affect.intensity.", 3, NULL, NULL, NULL));
     cJSON_AddItemToObject(ro, "role", spk_slot > 0 ? top(h, r, Q_SPK, row, "speaker.role.", 3, NULL, NULL, NULL) : cJSON_CreateArray());
     cJSON_AddItemToObject(ro, "item", top(h, r, Q_ITEM, row, "item.", 3, NULL, NULL, NULL));
     cJSON *st = cJSON_CreateObject();
@@ -434,6 +591,21 @@ static cJSON *readouts(const arctag_t *h, const run_t *r, int row, int spk_slot)
     }
     cJSON_AddItemToObject(ro, "state", st);
     return ro;
+}
+
+/* numpy's float32 pairwise summation (np.add.reduce on a contiguous 1-D float32 array) */
+static float pairwise_sum_f32(const float *a, int n) {
+    if (n < 8) { float res = 0.0f; for (int i = 0; i < n; i++) res += a[i]; return res; }
+    if (n <= 128) {
+        float r[8], res; int i;
+        for (int j = 0; j < 8; j++) r[j] = a[j];
+        for (i = 8; i < n - (n % 8); i += 8) for (int j = 0; j < 8; j++) r[j] += a[i + j];
+        res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        for (; i < n; i++) res += a[i];
+        return res;
+    }
+    int n2 = n / 2; n2 -= n2 % 8;
+    return pairwise_sum_f32(a, n2) + pairwise_sum_f32(a + n2, n - n2);
 }
 
 /* ------------------------------------------------------------------ spans */
@@ -483,9 +655,9 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
     for (int k = 0; k < W; k++) {
         int row = r0 + k;
         for (int c = 0; c < nin; c++) {
-            ON[k * nin + c] = (double)P(h, r, Q_IN, row, c) >= (double)pf->thr[Q_IN][c] && pf->valid[Q_IN][c];
+            ON[k * nin + c] = (double)P(h, r, Q_IN, row, c) >= (double)h->thr[Q_IN][c] && pf->valid[Q_IN][c];
             int bo = m->beg_of_in[c];
-            if (bo >= 0) BEG[k * nin + c] = (double)P(h, r, Q_BEG, row, bo) >= (double)pf->thr[Q_BEG][bo];
+            if (bo >= 0) BEG[k * nin + c] = (double)P(h, r, Q_BEG, row, bo) >= (double)h->thr[Q_BEG][bo];
             if (us[row]) BEG[k * nin + c] = 1;
         }
     }
@@ -509,7 +681,7 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
                 int w0 = r0 + a + off, w1 = r0 + k - 1 + 1 + off;
                 if (w1 > a0) {
                     double mx = 0; for (int t = a; t < k; t++) { double p = P(h, r, Q_IN, r0 + t, c); if (t == a || p > mx) mx = p; }
-                    span_t s = {c, w0, w1, mx, pf->thr[Q_IN][c], 0, 0, 0, 0, 0}; sp_push(&res, s);
+                    span_t s = {c, w0, w1, mx, h->thr[Q_IN][c], 0, 0, 0, 0, 0}; sp_push(&res, s);
                 }
                 a = -1;
             }
@@ -542,18 +714,18 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
                 int ga = xs->v[i].a, gb = xs->v[i].b, j = i + 1;
                 while (j < xs->n && xs->v[j].a < gb) { if (xs->v[j].b > gb) gb = xs->v[j].b; j++; }
                 if (j - i == 1 || !ncols) { sp_push(&outv, xs->v[i]); i = j; continue; }
-                double M[64]; int cnt = 0;
-                for (int t = 0; t < ncols; t++) M[t] = 0;
+                float M[64]; int cnt = 0;                      /* numpy float32 mean over rows (= reference) */
+                for (int t = 0; t < ncols; t++) M[t] = 0.0f;
                 for (int w = ga; w < gb; w++) {
                     int row = w - off; if (row < r0 || row >= r1) continue;
                     cnt++; for (int t = 0; t < ncols; t++) M[t] += P(h, r, Q_IN, row, cols[t]);
                 }
-                for (int t = 0; t < ncols; t++) M[t] /= cnt > 0 ? cnt : 1;
+                for (int t = 0; t < ncols; t++) M[t] /= (float)(cnt > 0 ? cnt : 1);
                 int b1 = 0; for (int t = 1; t < ncols; t++) if (M[t] > M[b1]) b1 = t;
                 int b2 = -1; for (int t = 0; t < ncols; t++) if (t != b1 && (b2 < 0 || M[t] > M[b2])) b2 = t;
                 double mx = 0; int first = 1;
                 for (int w = ga; w < gb; w++) { int row = w - off; if (row < r0 || row >= r1) continue; double p = P(h, r, Q_IN, row, cols[b1]); if (first || p > mx) mx = p; first = 0; }
-                span_t s = {cols[b1], ga, gb, mx, pf->thr[Q_IN][cols[b1]], 0, b2 >= 0, b2 >= 0 ? cols[b2] : 0, b2 >= 0 ? M[b2] : 0, 0};
+                span_t s = {cols[b1], ga, gb, mx, h->thr[Q_IN][cols[b1]], 0, b2 >= 0, b2 >= 0 ? cols[b2] : 0, b2 >= 0 ? M[b2] : 0, 0};
                 sp_push(&outv, s);
                 i = j;
             }
@@ -572,7 +744,7 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
             int c = find_str(m->cols[Q_IN], nin, m->fam[f].tags[t]);
             if (c >= 0 && headcol[c] && pf->valid[Q_IN][c]) mem[nm++] = t;
         }
-        double th = pf->head_thr[f];
+        double th = h->head[f];
         int *lab = (int *)calloc((size_t)W, sizeof(int));
         for (int k = 0; k < W; k++) {
             const float *pb = r->o[ib] + (size_t)(r0 + k) * 3;
@@ -588,8 +760,8 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
             while (e < W && lab[e] == 2) e++;
             int w0 = r0 + k + off, w1 = r0 + e - 1 + 1 + off;
             if (w1 > a0) {
-                double sc[64], pm[64], mx = 0;
-                for (int t = 0; t < nm; t++) { sc[t] = 0; pm[t] = 0; }
+                float sc[64], pm[64]; double mx = 0;          /* float32 sums (= reference) */
+                for (int t = 0; t < nm; t++) { sc[t] = 0.0f; pm[t] = 0.0f; }
                 for (int x = k; x < e; x++) {
                     const float *pt = r->o[it] + (size_t)(r0 + x) * nt;
                     for (int t = 0; t < nm; t++) {
@@ -603,7 +775,7 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
                 int b2 = -1; for (int t = 0; t < nm; t++) if (t != b1 && (b2 < 0 || sc[t] > sc[b2])) b2 = t;
                 int c = find_str(m->cols[Q_IN], nin, m->fam[f].tags[mem[b1]]);
                 span_t s = {c, w0, w1, mx, th, 1, b2 >= 0, 0, 0, 0};
-                if (b2 >= 0) { s.alt_c = find_str(m->cols[Q_IN], nin, m->fam[f].tags[mem[b2]]); s.alt_p = pm[b2] / (e - k); }
+                if (b2 >= 0) { s.alt_c = find_str(m->cols[Q_IN], nin, m->fam[f].tags[mem[b2]]); s.alt_p = pm[b2] / (float)(e - k); }
                 sp_push(&res, s);
             }
             k = e;
@@ -632,10 +804,13 @@ static cJSON *decode_spans(arctag_t *h, const run_t *r, const unsigned char *us,
             cJSON_AddItemToObject(o, "alt", al);
         }
         if (m->is_norm[s->c] && vm >= 0 && ve >= 0) {
-            double mean = 0; int cnt = 0;
-            for (int w = s->a; w < s->b; w++) { int row = w - off; if (row >= 0 && row < r->W) { mean += r->o[vm][row]; cnt++; } }
+            int ra = s->a - off, rb = s->b - off;
+            if (ra < 0) ra = 0;
+            if (rb > r->W) rb = r->W;
+            int cnt = rb > ra ? rb - ra : 0;
+            float mean = cnt ? pairwise_sum_f32(r->o[vm] + ra, cnt) / (float)cnt : 0.0f;    /* numpy float32 mean */
             int rl = s->b - 1 - off;
-            double v = (cnt ? mean / cnt : 0) + (rl >= 0 && rl < r->W ? r->o[ve][rl] : 0);
+            double v = (double)mean + (rl >= 0 && rl < r->W ? r->o[ve][rl] : 0);
             cJSON_AddItemToObject(o, "ver", jnum(1.0 / (1.0 + exp(-v))));
         }
         cJSON_AddItemToArray(out, o);
@@ -654,7 +829,7 @@ static void decode_events(arctag_t *h, const run_t *r, int r0, int r1, int off, 
             int q = qs[qi];
             for (int c = 0; c < h->m.nc[q]; c++) {
                 float p = P(h, r, q, row, c);
-                if (!((double)p >= (double)pf->thr[q][c] && pf->valid[q][c])) continue;
+                if (!((double)p >= (double)h->thr[q][c] && pf->valid[q][c]) || h->m.ev_skip[q][c]) continue;
                 int dup = 0;
                 for (int k = 0; k < h->nk && !dup; k++) {
                     const evkey_t *e = &h->keys[k];
@@ -669,7 +844,7 @@ static void decode_events(arctag_t *h, const run_t *r, int r0, int r1, int off, 
                 cJSON_AddStringToObject(o, "q", QN[q]);
                 cJSON_AddNumberToObject(o, "word", i);
                 cJSON_AddItemToObject(o, "score", jnum(p));
-                cJSON_AddItemToObject(o, "thr", jnum(pf->thr[q][c]));
+                cJSON_AddItemToObject(o, "thr", jnum(h->thr[q][c]));
                 cJSON_AddStringToObject(o, "text", ws[i].w);
                 cJSON_AddItemToArray(out, o);
             }
@@ -735,6 +910,117 @@ static int parse_word(arctag_t *h, cJSON *x, word_t *w, int *eou) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ output sections, filters, redaction */
+static int span_section(const char *t) {
+    if (starts_with(t, "safety.toxicity.")) return E_TOX;
+    if (starts_with(t, "safety.pii.")) return E_PII;
+    if (starts_with(t, "safety.profanity.")) return E_PROF;
+    if (starts_with(t, "entity.number.") || starts_with(t, "entity.numeral")) return E_NUMBER;
+    if (starts_with(t, "entity.mention.")) return E_ENTITY;
+    return -1;
+}
+
+static int rcat_of(const char *t) {
+    static const char *tags[] = {"safety.pii.phone_number", "safety.pii.email", "safety.pii.street_address", "safety.pii.card_account_number",
+                                 "safety.pii.gov_id", "safety.pii.date_of_birth", "safety.pii.private_name", "safety.pii.url_handle",
+                                 "safety.pii.public_contact", "safety.profanity.mild", "safety.profanity.strong",
+                                 "safety.toxicity.insult_harassment", "safety.toxicity.hate_identity", "safety.toxicity.threat_violence",
+                                 "safety.toxicity.sexual_explicit", "safety.toxicity.self_harm"};
+    static const int cat[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 10, 10, 10, 10, 10};
+    for (int i = 0; i < (int)(sizeof cat / sizeof cat[0]); i++) if (!strcmp(t, tags[i])) return cat[i];
+    return -1;
+}
+
+static int keep_tag(const arctag_t *h, const char *t) {
+    if (!h->ntagpre) return 1;
+    for (int i = 0; i < h->ntagpre; i++) if (starts_with(t, h->tagpre[i])) return 1;
+    return 0;
+}
+
+static const char *S_(cJSON *o, const char *k) { cJSON *x = cJSON_GetObjectItem(o, k); return cJSON_IsString(x) ? x->valuestring : ""; }
+static int I_(cJSON *o, const char *k) { cJSON *x = cJSON_GetObjectItem(o, k); return cJSON_IsNumber(x) ? x->valueint : 0; }
+
+/* stable sort of a cJSON array of spans by (start, -end) or, with by_type, (start, -end, type) */
+static cJSON **span_vec(cJSON *arr, int *n, int by_type) {
+    *n = cJSON_GetArraySize(arr);
+    cJSON **v = (cJSON **)malloc(sizeof(cJSON *) * (size_t)(*n + 1)); int k = 0;
+    for (cJSON *x = arr ? arr->child : NULL; x; x = x->next) v[k++] = x;
+    for (int i = 1; i < k; i++) {
+        cJSON *x = v[i]; int j = i - 1;
+        while (j >= 0) {
+            int a1 = I_(v[j], "start"), a2 = I_(x, "start"), b1 = I_(v[j], "end"), b2 = I_(x, "end"), gt;
+            if (a1 != a2) gt = a1 > a2; else if (b1 != b2) gt = b1 < b2; else gt = by_type && strcmp(S_(v[j], "type"), S_(x, "type")) > 0;
+            if (!gt) break;
+            v[j + 1] = v[j]; j--;
+        }
+        v[j + 1] = x;
+    }
+    return v;
+}
+
+/* redacted text of words[a, b): words of masked categories become [PHONE], [NAME], ... (one placeholder per span run) */
+static char *redact_text(const arctag_t *h, const word_t *ws, int a, int b, cJSON *spans) {
+    int W = b - a > 0 ? b - a : 0, n;
+    int *lc = (int *)malloc(sizeof(int) * (size_t)(W + 1)), *ls = (int *)malloc(sizeof(int) * (size_t)(W + 1));
+    for (int i = 0; i < W; i++) lc[i] = -1;
+    cJSON **v = span_vec(spans, &n, 1);
+    for (int k = 0; k < n; k++) {
+        int c = rcat_of(S_(v[k], "type"));
+        if (c < 0 || !h->rpol[c]) continue;
+        int s0 = I_(v[k], "start"), e0 = I_(v[k], "end");
+        for (int i = s0 > a ? s0 : a; i < e0 && i < b; i++) if (lc[i - a] < 0) { lc[i - a] = c; ls[i - a] = s0; }
+    }
+    free(v);
+    size_t L = 1; for (int i = a; i < b; i++) L += strlen(ws[i].w) + 12;
+    char *out = (char *)malloc(L); size_t k = 0; out[0] = 0;
+    for (int i = 0; i < W;) {
+        if (k) out[k++] = ' ';
+        if (lc[i] < 0) { size_t m = strlen(ws[a + i].w); memcpy(out + k, ws[a + i].w, m); k += m; i++; }
+        else {
+            int j = i; while (j < W && lc[j] == lc[i] && ls[j] == ls[i]) j++;
+            k += (size_t)sprintf(out + k, "[%s]", RLAB[lc[i]]); i = j;
+        }
+    }
+    out[k] = 0;
+    free(lc); free(ls);
+    return out;
+}
+
+static int filtering(const arctag_t *h) { return !h->all_emit || h->ntagpre; }
+
+static void filter_list(const arctag_t *h, cJSON *arr, const char *key) {
+    for (cJSON *x = arr ? arr->child : NULL; x;) { cJSON *nx = x->next; if (!keep_tag(h, S_(x, key))) cJSON_Delete(cJSON_DetachItemViaPointer(arr, x)); x = nx; }
+}
+
+static void filter_utt(const arctag_t *h, cJSON *u) {
+    static const int ek[] = {E_INTENT, E_ACT, E_SAFETY, E_EMOTION, E_AROUSAL, E_VALENCE, E_INTENSITY, E_ROLE, E_ITEM, E_STATE};
+    for (int i = 0; i < (int)(sizeof ek / sizeof ek[0]); i++) {
+        const char *k = EMIT_N[ek[i]]; cJSON *x = cJSON_GetObjectItem(u, k);
+        if (!x) continue;
+        if (!h->emit[ek[i]]) { cJSON_DeleteItemFromObject(u, k); continue; }
+        if (ek[i] != E_STATE) { filter_list(h, x, "tag"); continue; }
+        for (cJSON *g = x->child; g;) {
+            cJSON *ng = g->next; filter_list(h, g, "tag");
+            if (!cJSON_GetArraySize(g)) cJSON_Delete(cJSON_DetachItemViaPointer(x, g));
+            g = ng;
+        }
+    }
+}
+
+static void filter_result(const arctag_t *h, cJSON *res) {
+    if (!filtering(h)) return;
+    cJSON *sp = cJSON_GetObjectItem(res, "spans"), *ev = cJSON_GetObjectItem(res, "events"), *ut = cJSON_GetObjectItem(res, "utterances");
+    for (cJSON *x = sp ? sp->child : NULL; x;) {
+        cJSON *nx = x->next; int sec = span_section(S_(x, "type"));
+        if (sec < 0 || !h->emit[sec] || !keep_tag(h, S_(x, "type"))) cJSON_Delete(cJSON_DetachItemViaPointer(sp, x));
+        x = nx;
+    }
+    if (ev) { if (!h->emit[E_EVENTS]) while (cJSON_GetArraySize(ev)) cJSON_DeleteItemFromArray(ev, 0); else filter_list(h, ev, "type"); }
+    for (cJSON *u = ut ? ut->child : NULL; u; u = u->next) filter_utt(h, u);
+    cJSON *cur = cJSON_GetObjectItem(res, "current");
+    if (cJSON_IsObject(cur)) filter_utt(h, cur);
+}
+
 /* ------------------------------------------------------------------ public API */
 const char *arctag_version(void) { return ARCTAG_VERSION; }
 void arctag_free_str(char *s) { free(s); }
@@ -746,12 +1032,25 @@ static char *path_join(const char *d, const char *f) {
     return p;
 }
 
-arctag_t *arctag_create(const char *model_dir, char *err, size_t errlen) {
+static void set_model_path(arctag_t *h) {
+    free(h->model_path);
+    if (h->model_file && (strchr(h->model_file, '/') || strchr(h->model_file, '\\'))) h->model_path = xstrdup(h->model_file);
+    else h->model_path = path_join(h->model_dir, h->model_file ? h->model_file : h->precision == ARCTAG_INT8 ? "arctag_int8.onnx" : "arctag.onnx");
+}
+
+void arctag_options_init(arctag_options *o) {
+    if (!o) return;
+    memset(o, 0, sizeof *o);
+    o->size = sizeof *o; o->precision = ARCTAG_FP32; o->threads = 0; o->model_file = NULL;
+}
+
+arctag_t *arctag_create_ex(const char *model_dir, const arctag_options *opt, char *err, size_t errlen) {
     arctag_t *h = (arctag_t *)calloc(1, sizeof(arctag_t));
     if (!h) { if (err && errlen) snprintf(err, errlen, "out of memory"); return NULL; }
     const OrtApiBase *base = OrtGetApiBase();
     h->ort = base ? base->GetApi(ORT_API_VERSION) : NULL;
     char *p;
+    if (!model_dir) model_dir = "model";
     if (!h->ort) { set_err(h, "onnxruntime: API version %d not supported by the loaded library", ORT_API_VERSION); goto fail; }
     p = path_join(model_dir, "arctag_meta.json");
     if (load_meta(h, p)) { free(p); goto fail; }
@@ -759,12 +1058,20 @@ arctag_t *arctag_create(const char *model_dir, char *err, size_t errlen) {
     p = path_join(model_dir, "tokenizer.json");
     h->tok = arctok_load(p, h->err, sizeof h->err); free(p);
     if (!h->tok) goto fail;
-    h->prof = h->m.default_prof; h->asr = h->m.default_asr; h->max_ctx = h->m.max_ctx; h->stream_ctx = 256;
+    h->base_prof = h->m.default_prof; h->asr = h->m.default_asr; h->max_ctx = h->m.max_ctx; h->stream_ctx = 256;
+    h->fine_auto = 1; h->fine_chk = -1; h->all_emit = 1;
+    for (int e = 0; e < N_EMIT; e++) h->emit[e] = 1;
+    use_profile(h, h->base_prof);
     { const char *t = getenv("ARCTAG_THREADS"); h->threads = t ? atoi(t) : 0; }
+    { const char *t = getenv("ARCTAG_PRECISION"); h->precision = (t && !strcmp(t, "int8")) ? ARCTAG_INT8 : ARCTAG_FP32; }
+    if (opt && opt->size >= offsetof(arctag_options, precision) + sizeof opt->precision) h->precision = opt->precision == ARCTAG_INT8 ? ARCTAG_INT8 : ARCTAG_FP32;
+    if (opt && opt->size >= offsetof(arctag_options, threads) + sizeof opt->threads && opt->threads > 0) h->threads = opt->threads;
+    if (opt && opt->size >= offsetof(arctag_options, model_file) + sizeof opt->model_file && opt->model_file) h->model_file = xstrdup(opt->model_file);
     for (int q = 0; q < NQ; q++) { h->qo[q] = h->nout; h->out_names[h->nout++] = xstrdup(QN[q]); }
     for (int f = 0; f < h->m.nfam; f++) { h->out_names[h->nout++] = xstrdup(h->m.fam[f].out_t); h->out_names[h->nout++] = xstrdup(h->m.fam[f].out_b); }
     h->out_names[h->nout++] = xstrdup("ver_m"); h->out_names[h->nout++] = xstrdup("ver_e");
-    h->model_path = path_join(model_dir, "arctag.onnx");
+    h->model_dir = xstrdup(model_dir);
+    set_model_path(h);
     ORT_CHECK(h, h->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "arctag", &h->env));
     ORT_CHECK(h, h->ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &h->mem));
     if (open_session(h)) goto fail;
@@ -776,10 +1083,14 @@ fail:
     return NULL;
 }
 
+arctag_t *arctag_create(const char *model_dir, char *err, size_t errlen) { return arctag_create_ex(model_dir, NULL, err, errlen); }
+
 void arctag_reset(arctag_t *h) {
     if (!h) return;
     for (int i = 0; i < h->n; i++) word_free(&h->words[i]);
     h->n = 0; h->nb = 0; h->np = 0; h->nk = 0; h->lo = 0;
+    h->fine_chk = -1;
+    if (h->m.prof && h->prof != h->base_prof) use_profile(h, h->base_prof);
 }
 
 void arctag_destroy(arctag_t *h) {
@@ -790,10 +1101,86 @@ void arctag_destroy(arctag_t *h) {
     if (h->mem) h->ort->ReleaseMemoryInfo(h->mem);
     if (h->env) h->ort->ReleaseEnv(h->env);
     for (int i = 0; i < h->nout; i++) free(h->out_names[i]);
+    for (int q = 0; q < NQ; q++) free(h->thr[q]);
+    for (int i = 0; i < h->nov; i++) free(h->ov[i].pat);
+    free(h->ov);
+    for (int i = 0; i < h->ntagpre; i++) free(h->tagpre[i]);
+    free(h->tagpre);
     if (h->m.prof) free_meta(&h->m);
     arctok_free(h->tok);
-    free(h->model_path);
+    free(h->model_path); free(h->model_dir); free(h->model_file);
     free(h);
+}
+
+static int q_index(const char *name) { for (int q = 0; q < NQ; q++) if (!strcmp(QN[q], name)) return q; return -1; }
+
+static int set_threshold(arctag_t *h, const char *pattern, const char *value) {
+    char pat[256]; int q = -1;
+    snprintf(pat, sizeof pat, "%s", pattern);
+    if (!strncmp(pat, "head:", 5)) { q = -2; memmove(pat, pat + 5, strlen(pat + 5) + 1); }
+    else { char *at = strrchr(pat, '@'); if (at) { *at = 0; q = q_index(at + 1); if (q < 0) { set_err(h, "thr: unknown read-out '%s'", at + 1); return -1; } } }
+    if (!*pat) { set_err(h, "thr: empty pattern"); return -1; }
+    if (!value || !*value) {                                         /* remove the overrides of this pattern */
+        int k = 0;
+        for (int i = 0; i < h->nov; i++) { if (!strcmp(h->ov[i].pat, pat) && h->ov[i].q == q) free(h->ov[i].pat); else h->ov[k++] = h->ov[i]; }
+        h->nov = k; use_profile(h, h->prof); return 0;
+    }
+    char *end; double v = strtod(value, &end);
+    if (end == value || *end || v < 0 || v > 1.01) { set_err(h, "thr: value must be a number in 0..1.01"); return -1; }
+    h->ov = (thr_ov_t *)realloc(h->ov, sizeof(thr_ov_t) * (size_t)(h->nov + 1));
+    h->ov[h->nov].pat = xstrdup(pat); h->ov[h->nov].q = q; h->ov[h->nov].v = v; h->nov++;
+    use_profile(h, h->prof);
+    return 0;
+}
+
+static void split_list(const char *v, char ***out, int *n) {      /* comma / space separated items */
+    *n = 0; *out = NULL;
+    while (*v) {
+        while (*v == ',' || *v == ' ') v++;
+        const char *e = v; while (*e && *e != ',' && *e != ' ') e++;
+        if (e > v) {
+            *out = (char **)realloc(*out, sizeof(char *) * (size_t)(*n + 1));
+            char *t = (char *)malloc((size_t)(e - v) + 1); memcpy(t, v, (size_t)(e - v)); t[e - v] = 0; (*out)[(*n)++] = t;
+        }
+        v = e;
+    }
+}
+
+static int set_redact(arctag_t *h, const char *v) {
+    if (!strcmp(v, "off") || !*v) { h->redact = 0; memset(h->rpol, 0, sizeof h->rpol); return 0; }
+    if (!strcmp(v, "mask") || !strcmp(v, "on")) { h->redact = 1; for (int c = 0; c < N_RCAT; c++) h->rpol[c] = strcmp(RCAT[c], "contact") != 0; return 0; }
+    unsigned char pol[N_RCAT] = {0};
+    char **it; int n; split_list(v, &it, &n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        char *eq = strchr(it[i], '=');
+        int c = -1;
+        if (eq) { *eq = 0; for (int k = 0; k < N_RCAT; k++) if (!strcmp(RCAT[k], it[i])) c = k; }
+        if (c < 0 || (strcmp(eq + 1, "mask") && strcmp(eq + 1, "tag") && strcmp(eq + 1, "off"))) { ok = 0; set_err(h, "redact: bad policy item (category=mask|tag|off)"); }
+        else pol[c] = !strcmp(eq + 1, "mask");
+    }
+    for (int i = 0; i < n; i++) free(it[i]);
+    free(it);
+    if (!ok) return -1;
+    h->redact = 1; memcpy(h->rpol, pol, sizeof pol);
+    return 0;
+}
+
+static int set_emit(arctag_t *h, const char *v) {
+    unsigned char em[N_EMIT] = {0};
+    if (!*v || !strcmp(v, "all")) { for (int e = 0; e < N_EMIT; e++) h->emit[e] = 1; h->all_emit = 1; return 0; }
+    char **it; int n; split_list(v, &it, &n);
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        int e = -1; for (int k = 0; k < N_EMIT; k++) if (!strcmp(EMIT_N[k], it[i])) e = k;
+        if (e < 0) { ok = 0; set_err(h, "emit: unknown section '%s'", it[i]); } else em[e] = 1;
+        free(it[i]);
+    }
+    free(it);
+    if (!ok) return -1;
+    memcpy(h->emit, em, sizeof em); h->all_emit = 1;
+    for (int e = 0; e < N_EMIT; e++) if (!em[e]) h->all_emit = 0;
+    return 0;
 }
 
 int arctag_set_option(arctag_t *h, const char *key, const char *value) {
@@ -803,26 +1190,223 @@ int arctag_set_option(arctag_t *h, const char *key, const char *value) {
         for (int i = 0; i < h->m.nprof; i++) if (!strcmp(h->m.prof[i].name, value)) p = i;
         for (int i = 0; i < h->m.nalias && p < 0; i++) if (!strcmp(h->m.alias_k[i], value)) p = h->m.alias_v[i];
         if (p < 0) { set_err(h, "unknown domain '%s'", value); return -1; }
-        h->prof = p; arctag_reset(h); return 0;
+        h->base_prof = p; use_profile(h, p); arctag_reset(h); return 0;
     }
     if (!strcmp(key, "asr")) {
-        int a = find_str(h->m.asr, h->m.nasr, value);
+        int a = find_str(h->m.asr, h->m.nasr, !strcmp(value, "gold") ? "human" : value);   /* "gold": alias of "human" */
         if (a < 0) { set_err(h, "unknown asr source '%s'", value); return -1; }
         h->asr = a; arctag_reset(h); return 0;
     }
-    if (!strcmp(key, "threads")) { h->threads = atoi(value); return open_session(h); }
+    if (!strcmp(key, "precision")) {
+        int pr = !strcmp(value, "int8") ? ARCTAG_INT8 : !strcmp(value, "fp32") ? ARCTAG_FP32 : -1;
+        if (pr < 0) { set_err(h, "precision must be fp32 or int8"); return -1; }
+        if (pr == h->precision && !h->model_file) return 0;
+        int old = h->precision; char *oldf = h->model_file;
+        h->precision = pr; h->model_file = NULL; set_model_path(h);
+        if (open_session(h)) { h->precision = old; h->model_file = oldf; set_model_path(h); return -1; }
+        free(oldf);
+        return 0;
+    }
+    if (!strcmp(key, "threads")) { int t = atoi(value); if (t < 0) { set_err(h, "threads must be >= 0"); return -1; } if (t == h->threads && h->sess) return 0; h->threads = t; return open_session(h); }
     if (!strcmp(key, "max_ctx")) { int v = atoi(value); if (v < 16 || v > 2048) { set_err(h, "max_ctx must be 16..2048"); return -1; } h->max_ctx = v; return 0; }
     if (!strcmp(key, "stream_ctx")) { int v = atoi(value); if (v < 16 || v > 2048) { set_err(h, "stream_ctx must be 16..2048"); return -1; } h->stream_ctx = v; return 0; }
+    if (!strcmp(key, "fine_auto")) {
+        if (!strcmp(value, "on") || !strcmp(value, "1") || !strcmp(value, "true")) h->fine_auto = 1;
+        else if (!strcmp(value, "off") || !strcmp(value, "0") || !strcmp(value, "false")) h->fine_auto = 0;
+        else { set_err(h, "fine_auto must be on or off"); return -1; }
+        return 0;
+    }
+    if (!strcmp(key, "emit")) return set_emit(h, value);
+    if (!strcmp(key, "tags")) {
+        for (int i = 0; i < h->ntagpre; i++) free(h->tagpre[i]);
+        free(h->tagpre); h->tagpre = NULL; h->ntagpre = 0;
+        if (*value && strcmp(value, "all")) split_list(value, &h->tagpre, &h->ntagpre);
+        return 0;
+    }
+    if (!strcmp(key, "redact")) return set_redact(h, value);
+    if (!strncmp(key, "thr:", 4)) return set_threshold(h, key + 4, value);
+    if (!strcmp(key, "thr_reset")) { for (int i = 0; i < h->nov; i++) free(h->ov[i].pat); h->nov = 0; use_profile(h, h->prof); return 0; }
     set_err(h, "unknown option '%s'", key);
     return -1;
 }
 
+/* ------------------------------------------------------------------ config files */
+static const char *CFG_INFO[] = {"name", "description", "vertical", "mode", "model_dir", "notes", "use_case", "output", NULL};
+
+static int is_info_key(const char *k) {
+    if (k[0] == '_') return 1;
+    for (int i = 0; CFG_INFO[i]; i++) if (!strcmp(CFG_INFO[i], k)) return 1;
+    return 0;
+}
+
+static char *join_strs(cJSON *arr) {
+    size_t L = 1; for (cJSON *x = arr ? arr->child : NULL; x; x = x->next) if (cJSON_IsString(x)) L += strlen(x->valuestring) + 1;
+    char *s = (char *)malloc(L); s[0] = 0;
+    for (cJSON *x = arr ? arr->child : NULL; x; x = x->next) if (cJSON_IsString(x)) { if (*s) strcat(s, ","); strcat(s, x->valuestring); }
+    return s;
+}
+
+static int apply_config_obj(arctag_t *h, cJSON *j) {
+    char b[64];
+    for (cJSON *x = j->child; x; x = x->next) {
+        const char *k = x->string; int rc = 0;
+        if (is_info_key(k)) continue;
+        if (!strcmp(k, "domain") || !strcmp(k, "asr") || !strcmp(k, "precision")) {
+            if (!cJSON_IsString(x)) { set_err(h, "config: %s must be a string", k); return -1; }
+            rc = arctag_set_option(h, k, x->valuestring);
+        } else if (!strcmp(k, "threads") || !strcmp(k, "max_ctx") || !strcmp(k, "stream_ctx")) {
+            if (!cJSON_IsNumber(x)) { set_err(h, "config: %s must be a number", k); return -1; }
+            snprintf(b, sizeof b, "%d", x->valueint); rc = arctag_set_option(h, k, b);
+        } else if (!strcmp(k, "fine_auto")) {
+            rc = arctag_set_option(h, k, cJSON_IsTrue(x) ? "on" : "off");
+        } else if (!strcmp(k, "emit") || !strcmp(k, "tags")) {
+            if (!cJSON_IsArray(x)) { set_err(h, "config: %s must be an array of strings", k); return -1; }
+            char *s = join_strs(x); rc = arctag_set_option(h, k, cJSON_GetArraySize(x) || !strcmp(k, "tags") ? s : "all"); free(s);
+        } else if (!strcmp(k, "thresholds")) {
+            if (!cJSON_IsObject(x)) { set_err(h, "config: thresholds must be an object {pattern: value}"); return -1; }
+            arctag_set_option(h, "thr_reset", "");
+            for (cJSON *t = x->child; t && !rc; t = t->next) {
+                if (!cJSON_IsNumber(t)) { set_err(h, "config: threshold '%s' must be a number", t->string); return -1; }
+                snprintf(b, sizeof b, "%.17g", t->valuedouble); rc = set_threshold(h, t->string, b);
+            }
+        } else if (!strcmp(k, "redact")) {
+            if (cJSON_IsString(x)) rc = set_redact(h, x->valuestring);
+            else if (cJSON_IsObject(x)) {
+                const char *mode = S_(x, "mode"); cJSON *pol = cJSON_GetObjectItem(x, "policy");
+                if (!*mode || !strcmp(mode, "off")) rc = set_redact(h, "off");
+                else if (strcmp(mode, "mask")) { set_err(h, "config: redact.mode must be off or mask"); return -1; }
+                else if (cJSON_IsObject(pol) && pol->child) {
+                    size_t L = 1; for (cJSON *t = pol->child; t; t = t->next) L += strlen(t->string) + (cJSON_IsString(t) ? strlen(t->valuestring) : 0) + 2;
+                    char *s = (char *)calloc(L, 1);
+                    for (cJSON *t = pol->child; t; t = t->next) { if (*s) strcat(s, ","); strcat(s, t->string); strcat(s, "="); strcat(s, cJSON_IsString(t) ? t->valuestring : "?"); }
+                    rc = set_redact(h, s); free(s);
+                } else rc = set_redact(h, "mask");
+            } else { set_err(h, "config: redact must be a string or an object"); return -1; }
+        } else { set_err(h, "config: unknown key '%s'", k); return -1; }
+        if (rc) return -1;
+    }
+    return 0;
+}
+
+int arctag_apply_config(arctag_t *h, const char *config_json) {
+    if (!h || !config_json) return -1;
+    cJSON *j = cJSON_Parse(config_json);
+    if (!cJSON_IsObject(j)) { set_err(h, "config: expected a JSON object"); cJSON_Delete(j); return -1; }
+    int rc = apply_config_obj(h, j);
+    cJSON_Delete(j);
+    return rc;
+}
+
+arctag_t *arctag_create_from_config(const char *model_dir, const char *config_path, char *err, size_t errlen) {
+    char *txt = config_path ? read_file(config_path) : NULL;
+    if (!txt) { if (err && errlen) snprintf(err, errlen, "cannot read config %s", config_path ? config_path : "(null)"); return NULL; }
+    cJSON *j = cJSON_Parse(txt); free(txt);
+    if (!cJSON_IsObject(j)) { if (err && errlen) snprintf(err, errlen, "config %s: invalid JSON", config_path); cJSON_Delete(j); return NULL; }
+    arctag_options o; arctag_options_init(&o);
+    const char *pr = S_(j, "precision");
+    if (!strcmp(pr, "int8")) o.precision = ARCTAG_INT8;
+    cJSON *th = cJSON_GetObjectItem(j, "threads"); if (cJSON_IsNumber(th)) o.threads = th->valueint;
+    char *md = NULL;
+    if (!model_dir) {
+        const char *rel = S_(j, "model_dir");
+        if (*rel && rel[0] != '/' && !(rel[0] && rel[1] == ':')) {               /* relative to the config file */
+            const char *sl = strrchr(config_path, '/'), *bs = strrchr(config_path, '\\');
+            if (bs > sl) sl = bs;
+            if (sl) { size_t n = (size_t)(sl - config_path); char *d = (char *)malloc(n + 1); memcpy(d, config_path, n); d[n] = 0; md = path_join(d, rel); free(d); }
+            else md = xstrdup(rel);
+        } else md = xstrdup(*rel ? rel : "model");
+        model_dir = md;
+    }
+    arctag_t *h = arctag_create_ex(model_dir, &o, err, errlen);
+    free(md);
+    if (h && apply_config_obj(h, j)) {
+        if (err && errlen) snprintf(err, errlen, "%s", h->err);
+        arctag_destroy(h); h = NULL;
+    }
+    cJSON_Delete(j);
+    return h;
+}
+
 static char *print_free(cJSON *o) { char *s = cJSON_PrintUnformatted(o); cJSON_Delete(o); return s; }
+
+char *arctag_info(arctag_t *h) {
+    if (!h) return NULL;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "version", ARCTAG_VERSION);
+    cJSON_AddStringToObject(o, "precision", h->precision == ARCTAG_INT8 ? "int8" : "fp32");
+    cJSON_AddStringToObject(o, "model_file", h->model_path);
+    cJSON_AddStringToObject(o, "profile", h->m.prof[h->prof].name);
+    cJSON_AddStringToObject(o, "asr", h->m.asr[h->asr]);
+    cJSON_AddNumberToObject(o, "threads", h->threads);
+    cJSON_AddNumberToObject(o, "max_ctx", h->max_ctx);
+    cJSON_AddNumberToObject(o, "stream_ctx", h->stream_ctx);
+    cJSON_AddBoolToObject(o, "fine_auto", h->fine_auto);
+    cJSON *em = cJSON_AddArrayToObject(o, "emit");
+    for (int e = 0; e < N_EMIT; e++) if (h->emit[e]) cJSON_AddItemToArray(em, cJSON_CreateString(EMIT_N[e]));
+    cJSON *tg = cJSON_AddArrayToObject(o, "tags");
+    for (int i = 0; i < h->ntagpre; i++) cJSON_AddItemToArray(tg, cJSON_CreateString(h->tagpre[i]));
+    if (h->redact) {
+        cJSON *rp = cJSON_AddObjectToObject(o, "redact");
+        for (int c = 0; c < N_RCAT; c++) cJSON_AddStringToObject(rp, RCAT[c], h->rpol[c] ? "mask" : "off");
+    } else cJSON_AddStringToObject(o, "redact", "off");
+    cJSON *ov = cJSON_AddObjectToObject(o, "thresholds");
+    for (int i = 0; i < h->nov; i++) {
+        char k[300];
+        if (h->ov[i].q == -2) snprintf(k, sizeof k, "head:%s", h->ov[i].pat);
+        else if (h->ov[i].q >= 0) snprintf(k, sizeof k, "%s@%s", h->ov[i].pat, QN[h->ov[i].q]);
+        else snprintf(k, sizeof k, "%s", h->ov[i].pat);
+        cJSON_AddNumberToObject(ov, k, h->ov[i].v);
+    }
+    return print_free(o);
+}
+
+/* speaker slot of word `last` (same slot rule as the features), counting from word `from` */
+static int spk_slot_at(const word_t *ws, int from, int last) {
+    const char *names[16]; int ns = 0, slot = 0;
+    for (int k = from; k <= last; k++) if (ws[k].spk) {
+        int z = -1; for (int y = 0; y < ns; y++) if (!strcmp(names[y], ws[k].spk)) z = y;
+        if (z < 0) { if (ns < 16) names[ns] = ws[k].spk; z = ns < 16 ? ns++ : 15; }
+        if (k == last) slot = z + 1 > 9 ? 9 : z + 1;
+    }
+    return slot;
+}
+
+static void add_readouts(cJSON *o, cJSON *ro) {
+    for (cJSON *x = ro->child; x;) { cJSON *nx = x->next; cJSON_AddItemToObject(o, x->string, cJSON_DetachItemViaPointer(ro, x)); x = nx; }
+    cJSON_Delete(ro);
+}
+
+static int has_cues(const arctag_t *h, int p) {
+    for (int i = 0; i < h->m.ncues; i++) if (!strcmp(h->m.cues[i].ui, h->m.prof[p].ui)) return 1;
+    return 0;
+}
 
 /* offline tagging of words[0..n) with utterance starts us */
 static char *tag_words_impl(arctag_t *h, word_t *ws, int n, unsigned char *us) {
+    const int base = h->prof;
+    /* fine-domain switches (after each utterance, when n // fine_every changed) */
+    int seg_at[MAX_SEG + 1], seg_p[MAX_SEG], ns = 1;
+    seg_at[0] = 0; seg_p[0] = base;
+    if (h->fine_auto && has_cues(h, base) && n > 0) {
+        const char **wv = (const char **)malloc(sizeof(char *) * (size_t)n);
+        for (int i = 0; i < n; i++) wv[i] = ws[i].w;
+        int chk = -1, cur = base;
+        for (int e = 1; e <= n; e++) {
+            if (e < n && !us[e]) continue;
+            if (e / h->m.fine_every == chk) continue;
+            chk = e / h->m.fine_every;
+            int p = fine_hint(h, h->m.prof[base].ui, wv, e);
+            if (p >= 0 && p != cur && ns < MAX_SEG) { seg_at[ns] = e; seg_p[ns++] = p; cur = p; }
+        }
+        free(wv);
+    }
+    seg_at[ns] = n + 1;
+    int cut[MAX_SEG + 1];
+    cut[0] = -1; for (int k = 1; k < ns; k++) cut[k] = seg_at[k] - h->m.span_win > 0 ? seg_at[k] - h->m.span_win : 0;
+    cut[ns] = n + 1;
+
     cJSON *res = cJSON_CreateObject();
-    cJSON_AddStringToObject(res, "profile", h->m.prof[h->prof].name);
+    cJSON_AddStringToObject(res, "profile", h->m.prof[seg_p[ns - 1]].name);
     cJSON_AddNumberToObject(res, "n_words", n);
     cJSON *wa = cJSON_AddArrayToObject(res, "words");
     for (int i = 0; i < n; i++) cJSON_AddItemToArray(wa, cJSON_CreateString(ws[i].w));
@@ -834,36 +1418,52 @@ static char *tag_words_impl(arctag_t *h, word_t *ws, int n, unsigned char *us) {
         int c1 = c0 + h->max_ctx < n ? c0 + h->max_ctx : n, W = c1 - c0;
         unsigned char *u = (unsigned char *)malloc((size_t)W); memcpy(u, us + c0, (size_t)W); u[0] = 1;
         /* features restart at every chunk (= python reference): pass the chunk as its own word list */
-        run_t r;
-        if (run_model(h, ws + c0, W, 0, W, u, &r)) { free(u); ok = 0; break; }
-        append_all(spans, decode_spans(h, &r, u, 0, W, c0, -1, ws));
-        decode_events(h, &r, 0, W, c0, ws, events);
-        int a = 0;
-        for (int i = 1; i <= W; i++) {
-            if (i < W && !u[i]) continue;
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddNumberToObject(o, "start", a + c0); cJSON_AddNumberToObject(o, "end", i + c0);
-            char *t = join_words(ws, a + c0, i + c0); cJSON_AddStringToObject(o, "text", t); free(t);
-            int spk_slot = (int)0;
-            { /* speaker slot of the last word (same rule as the features) */
-                const char *names[16]; int ns = 0, slot = 0;
-                for (int k = c0; k < i + c0; k++) if (ws[k].spk) {
-                    int s = -1; for (int z = 0; z < ns; z++) if (!strcmp(names[z], ws[k].spk)) s = z;
-                    if (s < 0) { if (ns < 16) names[ns] = ws[k].spk; s = ns < 16 ? ns++ : 15; }
-                    if (k == i + c0 - 1) slot = s + 1 > 9 ? 9 : s + 1;
-                }
-                spk_slot = slot;
+        run_t rr[MAX_SEG]; int nr = 0;
+        cJSON *sp = cJSON_CreateArray();
+        for (int k = 0; k < ns && ok; k++) {
+            use_profile(h, seg_p[k]);
+            if (run_model(h, ws + c0, W, 0, W, u, &rr[k])) { ok = 0; break; }
+            nr++;
+            cJSON *sk = decode_spans(h, &rr[k], u, 0, W, c0, -1, ws);
+            for (cJSON *x = sk->child; x;) {
+                cJSON *nx = x->next; int e = I_(x, "end");
+                if (cut[k] < e && e <= cut[k + 1]) cJSON_AddItemToArray(sp, cJSON_DetachItemViaPointer(sk, x));
+                x = nx;
             }
-            cJSON *ro = readouts(h, &r, i - 1, spk_slot);
-            for (cJSON *x = ro->child; x;) { cJSON *nx = x->next; cJSON_AddItemToObject(o, x->string, cJSON_DetachItemViaPointer(ro, x)); x = nx; }
-            cJSON_Delete(ro);
-            cJSON_AddItemToArray(utts, o);
-            a = i;
+            cJSON_Delete(sk);
         }
-        run_free(h, &r); free(u);
+        if (ok) {
+            int m; cJSON **v = span_vec(sp, &m, 0);
+            for (int i = 0; i < m; i++) cJSON_AddItemToArray(spans, cJSON_DetachItemViaPointer(sp, v[i]));
+            free(v);
+            for (int k = 0; k < ns; k++) {
+                int hi = (c1 < seg_at[k + 1] ? c1 : seg_at[k + 1]) - c0;
+                if (hi <= 0) continue;
+                use_profile(h, seg_p[k]);
+                decode_events(h, &rr[k], 0, hi, c0, ws, events);
+            }
+            int a = 0;
+            for (int i = 1; i <= W; i++) {
+                if (i < W && !u[i]) continue;
+                int k = 0; for (int z = 1; z < ns; z++) if (seg_at[z] < i + c0) k = z;
+                use_profile(h, seg_p[k]);
+                cJSON *o = cJSON_CreateObject();
+                cJSON_AddNumberToObject(o, "start", a + c0); cJSON_AddNumberToObject(o, "end", i + c0);
+                char *t = join_words(ws, a + c0, i + c0); cJSON_AddStringToObject(o, "text", t); free(t);
+                add_readouts(o, readouts(h, &rr[k], i - 1, spk_slot_at(ws, c0, i + c0 - 1)));
+                cJSON_AddItemToArray(utts, o);
+                a = i;
+            }
+        }
+        cJSON_Delete(sp);
+        for (int k = 0; k < nr; k++) run_free(h, &rr[k]);
+        free(u);
     }
+    use_profile(h, base);
     free(h->keys); h->keys = saved_keys; h->nk = saved_nk; h->kcap = saved_cap;
     if (!ok) { cJSON_Delete(res); return NULL; }
+    if (h->redact) { char *r = redact_text(h, ws, 0, n, spans); cJSON_AddStringToObject(res, "redacted_text", r); free(r); }
+    filter_result(h, res);
     return print_free(res);
 }
 
@@ -963,6 +1563,7 @@ char *arctag_poll(arctag_t *h) {
     cJSON_AddNumberToObject(res, "n_words", n);
     int a0 = n - h->m.span_win > 0 ? n - h->m.span_win : 0;
     cJSON_AddNumberToObject(res, "a0", a0);
+    cJSON *prof = cJSON_AddStringToObject(res, "profile", h->m.prof[h->prof].name);
     if (!n) {
         cJSON_AddArrayToObject(res, "spans"); cJSON_AddArrayToObject(res, "events"); cJSON_AddArrayToObject(res, "utterances");
         cJSON_AddNullToObject(res, "current");
@@ -972,15 +1573,10 @@ char *arctag_poll(arctag_t *h) {
     unsigned char *us = (unsigned char *)calloc((size_t)W, 1);
     us[0] = 1;
     for (int b = 0; b < h->nb; b++) if (h->bounds[b] >= s && h->bounds[b] < n) us[h->bounds[b] - s] = 1;
-    run_t r;
+    run_t r, r2;
     if (run_model(h, h->words, n, s, n, us, &r)) { free(us); cJSON_Delete(res); return NULL; }
-    int d0 = a0 - 16 > s ? a0 - 16 : s;
-    cJSON_AddItemToObject(res, "spans", decode_spans(h, &r, us, d0 - s, W, s, a0, h->words));
-    cJSON *ev = cJSON_AddArrayToObject(res, "events");
-    int lo = h->lo > s ? h->lo : s;
-    decode_events(h, &r, lo - s, W, s, h->words, ev);
-    h->lo = n;
-    cJSON *utts = cJSON_AddArrayToObject(res, "utterances");
+    /* utterances closed since the last poll: read with the profile they were spoken under */
+    cJSON *utts = cJSON_CreateArray();
     for (int i = 0; i < h->np; i++) {
         int bi = h->pend[i], end = h->bounds[bi], start = bi ? h->bounds[bi - 1] : 0;
         if (end - 1 < s) continue;                                   /* fell out of the window: skipped */
@@ -988,36 +1584,46 @@ char *arctag_poll(arctag_t *h) {
         cJSON_AddNumberToObject(o, "start", start); cJSON_AddNumberToObject(o, "end", end);
         char *t = join_words(h->words, start, end); cJSON_AddStringToObject(o, "text", t); free(t);
         cJSON_AddBoolToObject(o, "final", 1);
-        int slot = 0;
-        { const char *names[16]; int ns = 0;
-          for (int k = 0; k < end; k++) if (h->words[k].spk) {
-              int z = -1; for (int y = 0; y < ns; y++) if (!strcmp(names[y], h->words[k].spk)) z = y;
-              if (z < 0) { if (ns < 16) names[ns] = h->words[k].spk; z = ns < 16 ? ns++ : 15; }
-              if (k == end - 1) slot = z + 1 > 9 ? 9 : z + 1;
-          } }
-        cJSON *ro = readouts(h, &r, end - 1 - s, slot);
-        for (cJSON *x = ro->child; x;) { cJSON *nx = x->next; cJSON_AddItemToObject(o, x->string, cJSON_DetachItemViaPointer(ro, x)); x = nx; }
-        cJSON_Delete(ro);
+        add_readouts(o, readouts(h, &r, end - 1 - s, spk_slot_at(h->words, 0, end - 1)));
         cJSON_AddItemToArray(utts, o);
     }
     h->np = 0;
+    int lo = h->lo > s ? h->lo : s;
+    cJSON *evs = cJSON_CreateArray();
+    /* fine domain inside sports / court from the lexicon cues of the words so far (when n // fine_every changed), after
+     * each update: the new words' events of the old profile stay, spans / events / the running
+     * read-out are then re-decoded with the new profile */
+    if (h->fine_auto && n / h->m.fine_every != h->fine_chk && has_cues(h, h->prof)) {
+        h->fine_chk = n / h->m.fine_every;
+        const char **wv = (const char **)malloc(sizeof(char *) * (size_t)n);
+        for (int i = 0; i < n; i++) wv[i] = h->words[i].w;
+        int p = fine_hint(h, h->m.prof[h->prof].ui, wv, n);
+        free(wv);
+        if (p >= 0 && p != h->prof) {
+            decode_events(h, &r, lo - s, W, s, h->words, evs);
+            use_profile(h, p);
+            if (run_model(h, h->words, n, s, n, us, &r2)) { run_free(h, &r); free(us); cJSON_Delete(utts); cJSON_Delete(evs); cJSON_Delete(res); return NULL; }
+            run_free(h, &r); r = r2; lo = s;
+            cJSON_SetValuestring(prof, h->m.prof[h->prof].name);
+        }
+    }
+    int d0 = a0 - 16 > s ? a0 - 16 : s;
+    cJSON *spans = decode_spans(h, &r, us, d0 - s, W, s, a0, h->words);
+    cJSON_AddItemToObject(res, "spans", spans);
+    decode_events(h, &r, lo - s, W, s, h->words, evs);
+    h->lo = n;
+    cJSON_AddItemToObject(res, "events", evs);
+    cJSON_AddItemToObject(res, "utterances", utts);
     int ustart = h->nb ? h->bounds[h->nb - 1] : 0;
     if (ustart < n) {
         cJSON *o = cJSON_CreateObject();
         cJSON_AddNumberToObject(o, "start", ustart); cJSON_AddNumberToObject(o, "end", n);
         cJSON_AddBoolToObject(o, "final", 0);
-        int slot = 0;
-        { const char *names[16]; int ns = 0;
-          for (int k = 0; k < n; k++) if (h->words[k].spk) {
-              int z = -1; for (int y = 0; y < ns; y++) if (!strcmp(names[y], h->words[k].spk)) z = y;
-              if (z < 0) { if (ns < 16) names[ns] = h->words[k].spk; z = ns < 16 ? ns++ : 15; }
-              if (k == n - 1) slot = z + 1 > 9 ? 9 : z + 1;
-          } }
-        cJSON *ro = readouts(h, &r, W - 1, slot);
-        for (cJSON *x = ro->child; x;) { cJSON *nx = x->next; cJSON_AddItemToObject(o, x->string, cJSON_DetachItemViaPointer(ro, x)); x = nx; }
-        cJSON_Delete(ro);
+        add_readouts(o, readouts(h, &r, W - 1, spk_slot_at(h->words, 0, n - 1)));
         cJSON_AddItemToObject(res, "current", o);
     } else cJSON_AddNullToObject(res, "current");
+    if (h->redact) { char *rt = redact_text(h, h->words, a0, n, spans); cJSON_AddStringToObject(res, "redacted_text", rt); free(rt); }
     run_free(h, &r); free(us);
+    filter_result(h, res);
     return print_free(res);
 }
