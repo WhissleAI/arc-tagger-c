@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Download the C-library model files of Arc Tagger v0.3.0 (onnx/ folder of the private Hugging Face repo) into ./model (or $1).
+# Download the C-library model files of Arc Tagger v0.4.0 (onnx/ folder of the private Hugging Face repo) into ./model (or $1).
 #   HF_TOKEN=hf_... scripts/fetch_model.sh [DEST_DIR]
 # Env:
 #   HF_REPO        default WhissleAI/arc-tagger
-#   HF_REVISION    default v0.3.0 (a tag, branch or commit of the model repo)
+#   HF_REVISION    default v0.4.0 (a tag, branch or commit of the model repo)
 #   ARCTAG_FETCH   fp32 | int8 | all (default all): which ONNX graphs to fetch
 #   ARCTAG_INT8_URL  optional URL of arctag_int8.onnx when it is not in the HF repo (e.g. a GitHub release asset;
 #                    a GitHub URL is fetched with $GITHUB_TOKEN when set)
 # The int8 graph is optional: if it can be found nowhere, the script says so and the fp32 files are still installed.
 set -euo pipefail
 REPO="${HF_REPO:-WhissleAI/arc-tagger}"
-REV="${HF_REVISION:-v0.3.0}"
+REV="${HF_REVISION:-v0.4.0}"
 WHICH="${ARCTAG_FETCH:-all}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-$ROOT/model}"
