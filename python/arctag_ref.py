@@ -94,6 +94,12 @@ class ArcTagger:
             raise ValueError("precision must be fp32 or int8")
         self.precision = precision
         so = ort.SessionOptions(); so.intra_op_num_threads = threads; so.inter_op_num_threads = 1
+        # = the C library's ONNX Runtime session (src/arctag.c open_ort): all graph optimisations, quantised-graph (QDQ)
+        # passes off. arctag_int8.onnx stores int8 weight tables behind DequantizeLinear; with the QDQ passes on, ONNX
+        # Runtime would fuse them into int8 MatMul kernels that also quantise the activations. Off, the tables fold into
+        # float once, at load, and compute stays in float. (No effect on the fp32 graph.)
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.add_session_config_entry("session.disable_quant_qdq", "1")
         fn = model_file or ("arctag_int8.onnx" if precision == "int8" else "arctag.onnx")
         self.sess = ort.InferenceSession(os.path.join(model_dir, fn), so, providers=["CPUExecutionProvider"])
         self.out_names = [o.name for o in self.sess.get_outputs()]

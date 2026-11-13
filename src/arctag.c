@@ -19,7 +19,7 @@
 #include <windows.h>
 #endif
 
-#define ARCTAG_VERSION "0.4.0"
+#define ARCTAG_VERSION "0.4.1"
 #define NQ 10
 #define P_MAX 8
 #define NFEAT 8

@@ -19,7 +19,7 @@ ctest --test-dir build --output-on-failure
 | variable | default | meaning |
 |---|---|---|
 | `HF_REPO` | `WhissleAI/arc-tagger` | Hugging Face repo |
-| `HF_REVISION` | `v0.4.0` | tag, branch or commit |
+| `HF_REVISION` | `v0.4.1` | tag, branch or commit |
 | `ARCTAG_FETCH` | `all` | `fp32`, `int8` or `all` |
 | `ARCTAG_INT8_URL` | | where to get `arctag_int8.onnx` if the HF repo does not have it |
 
@@ -28,7 +28,7 @@ All files are checked against `SHA256SUMS`.
 A model directory holds:
 
 - `arctag.onnx` (fp32);
-- `arctag_int8.onnx` (int8, optional);
+- `arctag_int8.onnx` (weight-only int8, optional);
 - `arctag_meta.json` (ontology read-outs, per-domain thresholds, decoding constants);
 - `tokenizer.json`.
 
@@ -53,7 +53,7 @@ Both make the same decisions; scores differ by about 1e-4 at most. Choose one wi
 | environment | `ARCTAG_BACKEND=onnxruntime`, used when the options leave the backend at its default |
 
 `arctag_info` reports `backend`, `weights` (`fp32`, `int8`, or `int8-folded` when the native backend converted a
-dynamically quantised file to float at load) and, for the native backend, `kernels` (`avx2`, `neon` or `scalar`) and
+dynamically quantised file, such as the int8 file of model releases up to v0.4.0, to float at load) and, for the native backend, `kernels` (`avx2`, `neon` or `scalar`) and
 `stream_state`.
 
 The native backend checks the model file when it loads it (every table's shape and every index range) and refuses a
@@ -245,7 +245,7 @@ sections and entries from the output. They never change what is computed.
 `arctag_info` returns:
 
 ```jsonc
-{"version": "0.4.0", "precision": "int8", "model_file": "model/arctag_int8.onnx", "profile": "auto:unknown", "asr": "unknown",
+{"version": "0.4.1", "precision": "int8", "model_file": "model/arctag_int8.onnx", "profile": "auto:unknown", "asr": "unknown",
  "threads": 1, "max_ctx": 2048, "stream_ctx": 96, "fine_auto": true, "emit": [...], "tags": [], "redact": "off", "thresholds": {}}
 ```
 
