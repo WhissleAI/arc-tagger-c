@@ -5,11 +5,11 @@ on:
   workflow_dispatch:
 
 # Model tests need the HF_TOKEN repository secret (read access to the private model repo). Optional:
-#   vars.HF_MODEL_REVISION   model repo revision (default v0.3.0)
+#   vars.HF_MODEL_REVISION   model repo revision (default v0.4.0)
 #   vars.ARCTAG_INT8_URL     where arctag_int8.onnx lives when it is not in the HF repo's onnx/ folder (+ GITHUB_TOKEN)
 # Without the int8 graph the int8 tests are reported as skipped.
 env:
-  HF_REVISION: ${{ vars.HF_MODEL_REVISION || 'v0.3.0' }}
+  HF_REVISION: ${{ vars.HF_MODEL_REVISION || 'v0.4.0' }}
   ARCTAG_INT8_URL: ${{ vars.ARCTAG_INT8_URL }}
 
 jobs:

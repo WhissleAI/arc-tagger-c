@@ -19,7 +19,7 @@
 #include <windows.h>
 #endif
 
-#define ARCTAG_VERSION "0.3.0"
+#define ARCTAG_VERSION "0.4.0"
 #define NQ 10
 #define P_MAX 8
 #define NFEAT 8
@@ -166,8 +166,6 @@ static int load_meta(arctag_t *h, const char *path) {
     m->n_dur = num_array(cJSON_GetObjectItem(j, "dur_edges"), m->dur_e, 16);
     m->n_conf = num_array(cJSON_GetObjectItem(j, "conf_edges"), m->conf_e, 16);
     m->asr = str_array(cJSON_GetObjectItem(j, "asr_sources"), &m->nasr);
-    for (int i = 0; i < m->nasr; i++)                 /* human-written text: the model files call it "gold"; the API says "human" */
-        if (!strcmp(m->asr[i], "gold")) { free(m->asr[i]); m->asr[i] = xstrdup("human"); }
     cJSON *da = cJSON_GetObjectItem(j, "default_asr");
     m->default_asr = cJSON_IsString(da) ? find_str(m->asr, m->nasr, da->valuestring) : 0;
     if (m->default_asr < 0) m->default_asr = 0;
@@ -1435,7 +1433,7 @@ int arctag_set_option(arctag_t *h, const char *key, const char *value) {
         h->base_prof = p; use_profile(h, p); arctag_reset(h); return 0;
     }
     if (!strcmp(key, "asr")) {
-        int a = find_str(h->m.asr, h->m.nasr, !strcmp(value, "gold") ? "human" : value);   /* "gold": alias of "human" */
+        int a = find_str(h->m.asr, h->m.nasr, value);
         if (a < 0) { set_err(h, "unknown asr source '%s'", value); return -1; }
         h->asr = a; arctag_reset(h); return 0;
     }

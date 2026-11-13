@@ -19,7 +19,7 @@ ctest --test-dir build --output-on-failure
 | variable | default | meaning |
 |---|---|---|
 | `HF_REPO` | `WhissleAI/arc-tagger` | Hugging Face repo |
-| `HF_REVISION` | `v0.3.0` | tag, branch or commit |
+| `HF_REVISION` | `v0.4.0` | tag, branch or commit |
 | `ARCTAG_FETCH` | `all` | `fp32`, `int8` or `all` |
 | `ARCTAG_INT8_URL` | | where to get `arctag_int8.onnx` if the HF repo does not have it |
 
@@ -37,11 +37,12 @@ A model directory holds:
 Two backends run the model from the same files:
 
 - `native` (default): plain C, one thread per handle. Streaming polls compute only the words added or revised since the
-  last poll, so a per-word poll costs about 1-3 ms. Loads in 40-70 ms.
+  last poll, so a per-word poll costs a few ms (see the benchmark in [int8.md](int8.md#speed-and-memory)). Loads in
+  well under 200 ms.
 - `onnxruntime`: ONNX Runtime 1.20.1, `threads` intra-op threads. Bit-equal to the Python reference. Each poll re-runs
-  the last `stream_ctx` words (about 100 ms per poll at 256).
+  the last `stream_ctx` words (about 150-200 ms per poll at 256 on one thread).
 
-Both make the same decisions; scores differ by at most a few 1e-4. Choose one with:
+Both make the same decisions; scores differ by about 1e-4 at most. Choose one with:
 
 | where | how |
 |---|---|
@@ -244,7 +245,7 @@ sections and entries from the output. They never change what is computed.
 `arctag_info` returns:
 
 ```jsonc
-{"version": "0.3.0", "precision": "int8", "model_file": "model/arctag_int8.onnx", "profile": "auto:unknown", "asr": "unknown",
+{"version": "0.4.0", "precision": "int8", "model_file": "model/arctag_int8.onnx", "profile": "auto:unknown", "asr": "unknown",
  "threads": 1, "max_ctx": 2048, "stream_ctx": 96, "fine_auto": true, "emit": [...], "tags": [], "redact": "off", "thresholds": {}}
 ```
 
@@ -260,15 +261,8 @@ sections and entries from the output. They never change what is computed.
   lowers the per-word cost and shortens the context (`edge_low_latency.json` uses 96), and polling every N words instead
   of every word also helps.
 
-## Upgrading from library 0.1.0
+## Model files and library versions
 
-The API is source compatible: every change is an addition. The output changes in these ways:
-
-- every utterance has `valence` and `intensity` lists;
-- poll results carry `profile`;
-- events are filtered to the package's display tier;
-- the 0.1.0 display floors for events (0.3) and utterance safety (0.4) are gone, as in the package;
-- the default `asr` is `unknown`;
-- `fine_auto` is on by default, so `profile` can change inside `sports` / `court`.
-
-0.1.0 model files do not load: use the v0.3.0 `onnx/` files.
+Use the `onnx/` files from the matching model release: the library version and the model tag are the same
+(`fetch_model.sh` fetches that tag by default). Files from another release can fail to load or decode differently,
+because the read-out columns, thresholds and span families live in `arctag_meta.json`.

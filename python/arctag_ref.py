@@ -194,8 +194,6 @@ class ArcTagger:
     def features(self, words, asr):
         """words: dicts {w, t0?, t1?, conf?, spk?, final?} -> per-word (pieces, wfl, feats, spk slot), the graph inputs"""
         asr = asr or self.meta.get("default_asr", "unknown")
-        if asr in ("human", "gold"):             # human-written text ("gold" is an alias); older model files call it "gold"
-            asr = "human" if "human" in self.asr_sources else "gold"
         a = asr if asr in self.asr_sources else "unknown"
         asr_i = self.asr_sources.index(a)
         spksrc = 2 if any(w.get("spk") is not None for w in words) else 0
