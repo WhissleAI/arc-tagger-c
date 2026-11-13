@@ -1,6 +1,6 @@
 # arctag: C API for the Arc Tagger
 
-A small C library, with a CLI, examples and a tiny JSON/HTTP server, around **Arc Tagger v0.4.0**. Arc Tagger is a
+A small C library, with a CLI, examples and a tiny JSON/HTTP server, around **Arc Tagger v0.4.1**. Arc Tagger is a
 text-only streaming tagger with about 10 M parameters. Give it words from any ASR, or plain text, and it returns:
 
 - **spans**:
@@ -21,8 +21,8 @@ text-only streaming tagger with about 10 M parameters. Give it words from any AS
 
 It runs on CPU with one of two backends: a **native** backend in plain C (the default: no dependencies, loads in well under
 200 ms, streams at a few ms per word) or **ONNX Runtime**. Both read the same model files: `arctag.onnx` (fp32, 34 MB)
-and `arctag_int8.onnx` (int8, 11.5 MB), and you choose one at load time. Decoding follows the T0 (zero-lag) path of the
-Arc Tagger v0.4.0 Python package. The output matches the package's tags and on/off decisions; with ONNX Runtime it
+and `arctag_int8.onnx` (weight-only int8, 9.4 MB), and you choose one at load time. Decoding follows the T0 (zero-lag) path of the
+Arc Tagger v0.4.1 Python package. The output matches the package's tags and on/off decisions; with ONNX Runtime it
 matches this repo's Python reference bit for bit, and the native backend makes the same decisions (see [Parity](#parity)).
 
 ## Quickstart
@@ -67,7 +67,7 @@ The model is in the **private** Hugging Face repo `WhissleAI/arc-tagger`. The C 
 | file | what |
 |---|---|
 | `onnx/arctag.onnx` | fp32 full-context T0 forward (opset 17, dynamic word axis, up to 2048 words per pass), probabilities out |
-| `onnx/arctag_int8.onnx` | the same graph with dynamic int8 weights (optional, see [Precision](#precision-fp32-and-int8)) |
+| `onnx/arctag_int8.onnx` | the same graph with int8 weight tables and float compute (weight-only int8; optional, see [Precision](#precision-fp32-and-int8)) |
 | `onnx/arctag_meta.json` | read-out columns, per-profile thresholds, span-head families, event tiers, fine-domain cues, feature buckets |
 | `onnx/tokenizer.json` | byte-level BPE (8k) tokenizer, read directly by the C tokenizer |
 | `onnx/SHA256SUMS` | checksums, verified by `fetch_model.sh` |
@@ -82,7 +82,7 @@ To fetch them:
 | variable | default | meaning |
 |---|---|---|
 | `HF_REPO` | `WhissleAI/arc-tagger` | repo |
-| `HF_REVISION` | `v0.4.0` | tag, branch or commit |
+| `HF_REVISION` | `v0.4.1` | tag, branch or commit |
 | `ARCTAG_FETCH` | `all` | `fp32`, `int8` or `all` |
 | `ARCTAG_INT8_URL` | | another location for the int8 graph |
 
@@ -131,7 +131,7 @@ arctag_destroy(h);
 
 Every returned string is malloc'd JSON, which you release with `arctag_free_str`. A handle is not thread-safe, so use
 one per stream or thread. Each handle holds its own copy of the model: with the native backend about 72 MB peak RSS with
-fp32 and 26 MB with weight-only int8; with ONNX Runtime about 118 MB with fp32 and 77 MB with dynamic int8 (see
+fp32 and 26 MB with int8; with ONNX Runtime about 118 MB with either file, because the int8 tables become float at load (see
 [Backends](#backends)). Under ONNX Runtime a full 2048-word pass peaks near 1 GB, because memory grows faster than
 linearly with the window, so lower `max_ctx` to reduce that.
 
@@ -227,43 +227,31 @@ numbers on a quiet machine will be lower; compare the ratios.
 | backend, model file | file | load | streaming | batch | peak RSS |
 |---|---|---|---|---|---|
 | ONNX Runtime, fp32 | 34.0 MB | 935 ms | 185 / 279 | 0.58 | 118 MB |
-| ONNX Runtime, int8 (dynamic) | 11.5 MB | 563 ms | 155 / 177 | 0.45 | 77 MB |
-| ONNX Runtime, int8 (weight-only) | 9.4 MB | 712 ms | 191 / 277 | 0.77 | 118 MB |
+| ONNX Runtime, int8 | 9.4 MB | 712 ms | 191 / 277 | 0.77 | 118 MB |
 | **native, fp32** | 34.0 MB | **155 ms** | **6.2 / 12.1** | 0.96 | 72 MB |
-| native, int8 (dynamic) | 11.5 MB | 110 ms | 6.4 / 13.4 | 1.14 | 52 MB |
-| **native, int8 (weight-only)** | **9.4 MB** | **68 ms** | **2.9 / 7.9** | 0.66 | **26 MB** |
+| **native, int8** | **9.4 MB** | **68 ms** | **2.9 / 7.9** | 0.66 | **26 MB** |
 
 The native backend streams about 30x faster, because a poll costs one word instead of `stream_ctx` words; it also loads
 about 6x faster and uses less memory. For one-shot `tag_text` ONNX Runtime is faster (0.58 vs 0.96 ms per word).
-The weight-only int8 file (made with `tools/quantize_model.py`) is the fastest and smallest under the native backend; see
-[Precision](#precision-fp32-and-int8).
+The int8 file is the fastest and smallest under the native backend; see [Precision](#precision-fp32-and-int8).
 
 ## Precision: fp32 and int8
 
-Two int8 files work with both backends:
+`arctag_int8.onnx` is **weight-only int8**: the weight tables are stored as int8 with one scale per column, and compute
+stays in float (activations are never quantised). It is made from `arctag.onnx` with
+`python tools/quantize_model.py model/arctag.onnx model/arctag_int8.onnx`, so you can rebuild it yourself. 9.4 MB.
 
-- **weight-only int8** (`python tools/quantize_model.py model/arctag.onnx model/arctag_int8.onnx`): int8 weight tables,
-  float compute. 9.4 MB. Streaming equals the offline pass exactly. **Recommended**, especially with the native backend
-  (26 MB RSS, about 2x faster streaming than fp32), and it agrees best with fp32.
-- **dynamic int8** (the `arctag_int8.onnx` the model repo ships today): activations are quantised per call under ONNX
-  Runtime. 11.5 MB. The native backend converts it to float tables at load.
+- **native backend**: the tables stay int8 in memory (26 MB RSS), and streaming is about 2x faster than fp32.
+- **ONNX Runtime**: the tables become float once, at load (fp32 speed and memory).
+- Streaming equals the offline pass exactly on both backends, and the thresholds are the same as for fp32.
 
-Agreement of the int8 files with fp32 (`int8_agreement`, the 120 parity cases):
+Agreement with fp32 (`int8_agreement`, the 120 parity cases): span F1 0.987, max |p diff| 0.103, on both backends.
+On the Whissle internal held-out test set it agrees with fp32 on 98.6% of spans (toxicity 92%, PII 98%, numbers 99%) and
+on 98-99% of events, intents and safety read-outs; span F1 against the test labels is within 0.1 pt of fp32 (0.543 vs
+0.544), and intent accuracy is the same.
 
-| | span F1 vs fp32 | max \|p diff\| |
-|---|---|---|
-| weight-only int8, either backend | 0.987 | 0.103 |
-| dynamic int8, native | 0.981 | 0.123 |
-| dynamic int8, ONNX Runtime | 0.975 | 0.172 |
-
-On the Whissle internal held-out test set the dynamic int8 file under ONNX Runtime agrees with fp32 on 96% of spans
-(toxicity 82%, PII 94%, numbers 97%) and on 96-98% of events, intents and safety read-outs; span F1 against the test
-labels is within 0.3 pt of fp32 (0.542 vs 0.544). The weight-only file agrees on 98.6% of spans (toxicity 92%) and
-matches fp32 span F1 within 0.1 pt and intent accuracy exactly.
-
-Use int8 for edge devices and many handles per process, and fp32 when you need the reference output. Under ONNX
-Runtime, dynamic int8 streaming scores depend slightly on the window, because activations are quantised per call; the
-weight-only file and the native backend do not have this effect. [docs/int8.md](docs/int8.md) has the details.
+Use int8 for edge devices and many handles per process, and fp32 when you need the reference output.
+[docs/int8.md](docs/int8.md) has the details.
 
 ## Configs and verticals
 
@@ -321,10 +309,10 @@ through `ctypes`. [demo/README.md](demo/README.md) covers the flags, the tabs an
 
 | check | result |
 |---|---|
-| Python reference (fp32) vs the Arc Tagger v0.4.0 Python package, 16 texts x 7 domains | 526 spans, 294 events, 280 utterances and 2,728 read-out rows: same tags, ranges and on/off decisions, same top affect, same redacted text and fine domain; max p diff 5e-4 (the package rounds to 1e-3). One listing difference: an off safety row whose p sits on the listing floor (0.5 x thr = 0.01; reference p 0.009994) is listed by the package only |
+| Python reference (fp32) vs the Arc Tagger v0.4.1 Python package, 16 texts x 7 domains | 526 spans, 294 events, 280 utterances and 2,728 read-out rows: same tags, ranges and on/off decisions, same top affect, same redacted text and fine domain; max p diff 5e-4 (the package rounds to 1e-3). One listing difference: an off safety row whose p sits on the listing floor (0.5 x thr = 0.01; reference p 0.009994) is listed by the package only |
 | C tokenizer vs HF `tokenizers`, 37 strings (punctuation, numbers, emoji, CJK, Cyrillic, Arabic digits, special tokens) | identical ids |
 | C library vs Python reference, fp32, 120 cases (8 with configs: emit, tags, redaction, overrides) | 563 spans, all fields identical, scores bit-equal |
-| C library vs Python reference, int8 | 564 spans, all fields identical, scores bit-equal |
+| C library vs Python reference, int8 | 566 spans, all fields identical, scores bit-equal |
 | C streaming (push per utterance + poll) vs `arctag_tag_text`, fp32 | identical within 1e-4 |
 | native backend vs Python reference, fp32, 120 cases | 563 spans, every tag, range and on/off decision identical; max score difference 4.6e-5 |
 | native streaming vs native `arctag_tag_text`, fp32 and int8 | identical (scores bit-equal) |
