@@ -277,6 +277,7 @@ Load one with `-c`, `arctag_create_from_config` or `POST /config`.
 | [`news`](configs/news.json) | news and talk shows | news domain, batch, entities, story starts, roles, breaking-news state |
 | [`pii_redaction`](configs/pii_redaction.json) | generic redaction | PII + utterance safety only, mask every private PII category |
 | [`edge_low_latency`](configs/edge_low_latency.json) | devices, low latency | **int8, 1 thread**, streaming ctx 96 |
+| [`kids_game`](configs/kids_game.json) | kids apps and games | **kids domain** + guard layer: profanity / insult / threat as utterance tags, evidence-gated PII, self-harm / grooming / jailbreak backstops, `command_context` for cockpit commands ([docs/KIDS.md](docs/KIDS.md)) |
 
 The examples show how each API is used:
 
@@ -380,15 +381,16 @@ checking.
 ```
 include/arctag.h        public API
 src/arctag.c            features, backends, decoding, configs, redaction, JSON
+src/guard.c             kids / game guard layer (src/kids_thr.inc: kids thresholds)
 src/native.c            native backend (plain C; AVX2 / NEON kernels where available)
 src/onnx_file.c         reads the model tables from the .onnx files for the native backend
 src/tokenizer.c         byte-level BPE reading tokenizer.json (+ src/unicode_tables.h from tools/gen_unicode.py)
 configs/                vertical configs (JSON)
 demo/                   web demo: server.py (asyncio + ctypes), arctag_ffi.py (ctypes binding), static/ (page)
 examples/               arctag_cli, arctag_server, batch_tag, stream_asr, redact, vertical_run, compare_precision, bench; data/
-tests/                  test_tokenizer, test_parity, test_config, test_int8_agreement, test_native, demo_smoke.py, expected/ (made-up texts), make_expected.py
-python/arctag_ref.py    Python reference (numpy + onnxruntime + tokenizers)
-docs/                   USAGE.md, int8.md
+tests/                  test_tokenizer, test_parity, test_config, test_int8_agreement, test_native, test_kids, test_guard_tables.py, demo_smoke.py, expected/ (made-up texts), make_expected.py
+python/arctag_ref.py    Python reference (numpy + onnxruntime + tokenizers); python/arctag_guard.py: guard layer
+docs/                   USAGE.md, int8.md, KIDS.md
 scripts/                download_onnxruntime.sh/.ps1, fetch_model.sh
 tools/quantize_model.py weight-only int8 storage for arctag.onnx (smaller file, float compute, streaming-exact)
 third_party/cjson       cJSON 1.7.19 (MIT)

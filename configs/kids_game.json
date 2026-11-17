@@ -1,0 +1,18 @@
+{
+  "name": "kids_game",
+  "use_case": "Kids learning app / game voice turns: profanity, insults, threats, self-harm, grooming, PII, jailbreak",
+  "description": "Short spoken turns of children talking to an in-game character. Domain kids: thresholds fitted on kid turns plus the guard layer (profanity, insult and threat as utterance safety tags; PII tags need evidence in the words; backstops for self-harm, grooming, sexual content and jailbreak). Set command_context on while the child is on a command screen so cockpit commands (\"kill the heaters\") are never flagged.",
+  "model_dir": "../model",
+  "precision": "int8",
+  "threads": 1,
+  "mode": "streaming",
+  "stream_ctx": 64,
+  "domain": "kids",
+  "guard": "auto",
+  "command_context": false,
+  "asr": "unknown",
+  "emit": ["profanity", "toxicity", "pii", "safety", "intent", "emotion"],
+  "tags": [],
+  "redact": "off",
+  "_notes": "Self-harm and grooming are review triggers for a caring adult or a human moderator, not automatic actions. See docs/KIDS.md for the per-tag calibration table."
+}

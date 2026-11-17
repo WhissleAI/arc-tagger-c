@@ -189,6 +189,7 @@ A masked span becomes `[PHONE]`, `[EMAIL]`, `[ADDRESS]`, `[CARD]`, `[GOV_ID]`, `
 | `news.json` | news / talk | fp32 / 2 | batch | news | entity number profanity toxicity events intent role state | none | off |
 | `pii_redaction.json` | generic PII redaction | fp32 / 4 | batch | auto | pii safety | none (PII head already at the 0.3 floor) | mask (default policy) |
 | `edge_low_latency.json` | low-latency edge | **int8 / 1** | streaming, ctx 96 | auto | entity number pii profanity toxicity events intent act safety | none | off |
+| `kids_game.json` | kids apps and games | **int8 / 1** | streaming, ctx 64 | kids (guard on; `command_context` per turn) | profanity toxicity pii safety intent emotion | kids thresholds (built in / `arctag_kids.json`) | off |
 
 Each config's `_notes` explains its choices. Copy one and edit it for your own use: change the domain, drop sections you
 don't need with `emit`, and move a threshold down for recall or up for precision.

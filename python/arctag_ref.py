@@ -13,6 +13,7 @@ ONNX inference only: the same input features, ONNX graph and decoding as the C l
 """
 import json, math, os, re, sys
 import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # arctag_guard
 
 WS = re.compile(r"[ \t\n\r\f\v]+")
 SENT_END = (".", "?", "!")
@@ -112,6 +113,53 @@ class ArcTagger:
         self.emit = None             # None = everything, else a set of sections
         self.tags = None             # None = every tag, else a list of tag prefixes
         self.fine_auto = True
+        self.guard = None            # None = auto (on for the kids profile), True / False
+        self.cmd_ctx = False         # command context (kids guard): the turn is a command on a game screen
+        self.kids_prof_min = 0.9
+        self._add_kids_profile(model_dir)
+
+    def _add_kids_profile(self, model_dir):
+        """"kids:kids" (aliases kids, game) = src/arctag.c add_kids_profile: the assistant profile with the kids
+        thresholds (arctag_kids.json in the model directory, else the built-in table) and the guard layer on"""
+        import arctag_guard as G
+        m = self.meta
+        P = m["profiles"]
+        have = "kids:kids" in P
+        if not have and "assistant:assistant" not in P:
+            return
+        j = None
+        fn = os.path.join(model_dir, "arctag_kids.json")
+        if os.path.exists(fn):
+            j = json.load(open(fn))
+        if not have:
+            B = P["assistant:assistant"]
+            K = dict(B, ui="kids", fine="kids", thr={q: list(v) for q, v in B["thr"].items()}, valid=B["valid"],
+                     head_thr=dict(B["head_thr"]))
+            th = (j or {}).get("thr")
+            for pat, v in (th.items() if isinstance(th, dict) else G.KIDS_THR.items()):
+                if pat.startswith("head:"):
+                    if pat[5:] in K["head_thr"]:
+                        K["head_thr"][pat[5:]] = v
+                    continue
+                q0 = None
+                if "@" in pat:
+                    pat, q0 = pat.rsplit("@", 1)
+                for q, names in self.cn.items():
+                    if q0 is None or q0 == q:
+                        for c, t in enumerate(names):
+                            if thr_match(pat, t):
+                                K["thr"][q][c] = v
+            for fam, v in ((j or {}).get("head_thr") or {}).items():
+                if fam in K["head_thr"]:
+                    K["head_thr"][fam] = v
+            P["kids:kids"] = K
+        pm = ((j or {}).get("guard") or {}).get("profanity_model_min")
+        if isinstance(pm, (int, float)):
+            self.kids_prof_min = float(pm)
+        m.setdefault("aliases", {}).update({"kids": "kids:kids", "game": "kids:kids"})
+
+    def guard_active(self, prof):
+        return self.guard if self.guard is not None else prof.get("ui") == "kids"
 
     # ---------------------------------------------------------------- options (= the C library's)
     def set_threshold(self, pattern, value):
@@ -142,6 +190,10 @@ class ArcTagger:
                 self.tags = list(v) or None
             elif k == "fine_auto":
                 self.fine_auto = bool(v)
+            elif k == "guard":
+                self.guard = None if v in ("auto", "", None) else v in (True, "on", "1", "true")
+            elif k == "command_context":
+                self.cmd_ctx = v in (True, "on", "1", "true")
 
     def _thresholds(self, prof):
         """the profile's thresholds with the overrides applied (a copy)"""
@@ -256,7 +308,8 @@ class ArcTagger:
         ro = {"intent": self._top(prof, "utt", U, "intent.", 3) + self._top(prof, "utt", U, "discourse.intent.", 3),
               "act": self._top(prof, "utt", U, "discourse.act.", 3) + self._top(prof, "utt", U, "discourse.answer", 1)
               + self._top(prof, "utt", U, "discourse.backchannel", 1) + self._top(prof, "utt", U, "discourse.assistant.", 1),
-              "safety": [r for r in self._top(prof, "utt", U, "safety.", 20) if r["p"] >= 0.5 * r["thr"]][:6],
+              "safety": self._top(prof, "utt", U, "safety.", 20) if self.guard_active(prof) else
+              [r for r in self._top(prof, "utt", U, "safety.", 20) if r["p"] >= 0.5 * r["thr"]][:6],
               "emotion": self._top(prof, "utt", U, "affect.emotion.", 3),
               "arousal": self._top(prof, "utt", U, "affect.arousal.", 3),
               "valence": self._top(prof, "utt", U, "affect.valence.", 3),
@@ -450,6 +503,9 @@ class ArcTagger:
                 u = {"start": a + c0, "end": b + c0, "text": " ".join(w["w"] for w in ws[a:b])}
                 u.update(self.readouts(profs[k], Os[k], b - 1, feats[b - 1][3]))
                 res["utterances"].append(u)
+        if self.guard_active(profs[-1]):
+            import arctag_guard as G
+            G.apply(res, [w["w"] for w in words], 0, self.cmd_ctx, profs[-1]["head_thr"].get("safety.profanity", 0.5), self.kids_prof_min)
         return self.finish(res, words)
 
     # ---------------------------------------------------------------- redaction + output filters

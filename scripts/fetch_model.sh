@@ -33,6 +33,9 @@ for f in "${files[@]}"; do
   hf_get "$f" || { rm -f "$DEST/$f.part"; echo "failed to fetch onnx/$f from ${REPO}@${REV}" >&2; exit 1; }
 done
 
+# optional: kids-domain thresholds (the library has a built-in copy)
+hf_get arctag_kids.json 2>/dev/null && echo "fetched onnx/arctag_kids.json" || rm -f "$DEST/arctag_kids.json.part"
+
 if [ "$WHICH" != fp32 ]; then
   echo "fetching onnx/arctag_int8.onnx"
   if ! hf_get arctag_int8.onnx; then
