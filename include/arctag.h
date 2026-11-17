@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define ARCTAG_VERSION_MAJOR 0
-#define ARCTAG_VERSION_MINOR 3
+#define ARCTAG_VERSION_MINOR 5
 #define ARCTAG_VERSION_PATCH 0
 
 typedef struct arctag arctag_t;
@@ -70,6 +70,16 @@ ARCTAG_API int arctag_apply_config(arctag_t *h, const char *config_json);
 /* Options (return 0 on success, -1 on an unknown key / bad value):
  *   "domain"     profile: auto (default) | talk | meeting | court | assistant | sports | news, or a fine domain
  *                (nba nhl nfl soccer cricket court_appellate court_trial assistant_noisy stream_chat), or "ui:fine"
+ *                kids | game (alias): short spoken turns of children in an app or game: the assistant domain with
+ *                thresholds fitted on kid turns (arctag_kids.json in the model dir overrides the built-in table) and the
+ *                guard layer on (docs/KIDS.md).
+ *   "guard"      auto (default: on for kids / game) | on | off: the kids guard layer. On: profanity / insult / threat
+ *                also appear as utterance safety tags, PII tags need evidence in the words, deterministic backstops for
+ *                self-harm, grooming, sexual content and jailbreak, and model-only tags can be gated off. Rule-decided
+ *                entries carry "src" ("rule", "lexicon", "pii_evidence", "span") and "p_model"; gated ones "on":false
+ *                and "gated" (reason). Lexicon profanity spans carry "src":"lexicon".
+ *   "command_context" on | off (default off): the app says the current turn is a command on a game screen ("kill the
+ *                heaters", "fire the thrusters"): with the guard on, model-only safety tags of such a turn are gated.
  *   "asr"        word source the text comes from (names in arctag_meta.json "asr_sources"; default "unknown")
  *   "backend"    native | onnxruntime (reloads the model)
  *   "precision"  fp32 | int8 (reloads the model)

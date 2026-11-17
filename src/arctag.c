@@ -4,6 +4,7 @@
 #include "tokenizer.h"
 #include "native.h"
 #include "cJSON.h"
+#include "guard.h"
 #ifdef ARCTAG_WITH_ORT
 #include <onnxruntime_c_api.h>
 #endif
@@ -19,7 +20,7 @@
 #include <windows.h>
 #endif
 
-#define ARCTAG_VERSION "0.4.1"
+#define ARCTAG_VERSION "0.5.0"
 #define NQ 10
 #define P_MAX 8
 #define NFEAT 8
@@ -89,6 +90,8 @@ struct arctag {
     int fine_auto, fine_chk;
     unsigned char emit[N_EMIT]; int all_emit; char **tagpre; int ntagpre;
     int redact; unsigned char rpol[N_RCAT];  /* redact: 0 off, 1 on; rpol: 1 = mask */
+    int guard, cmd_ctx;                   /* guard layer: -1 = auto (on for the kids profile), 0 off, 1 on; command context */
+    double kids_prof_min;                 /* guard: a model profanity span on an unlisted word needs this score */
     char err[512];
     /* stream */
     word_t *words; int n, cap;
@@ -283,6 +286,74 @@ static void free_meta(meta_t *m) {
     free(m->prof);
     for (int i = 0; i < m->nalias; i++) free(m->alias_k[i]);
     free(m->alias_k); free(m->alias_v);
+}
+
+/* ------------------------------------------------------------------ kids / game profile
+ * "kids:kids" (aliases kids, game): the assistant domain's model input with thresholds fitted on short kid turns, and the
+ * guard layer on (src/guard.c, docs/KIDS.md). Its thresholds come from arctag_kids.json in the model directory when there
+ * is one, else from the built-in table below (fitted for Arc Tagger v0.4.1). A meta file that already has "kids:kids" is
+ * used as it is. */
+static const struct { const char *pat; double v; } KIDS_THR[] = {
+#include "kids_thr.inc"
+    {NULL, 0}};
+
+static char *path_join(const char *d, const char *f);
+
+static void prof_set(meta_t *m, profile_t *P, const char *pattern, double v) {
+    char pat[256]; int q = -1;
+    snprintf(pat, sizeof pat, "%s", pattern);
+    char *at = strrchr(pat, '@');
+    if (at) { *at = 0; for (int k = 0; k < NQ; k++) if (!strcmp(QN[k], at + 1)) q = k; if (q < 0) return; }
+    size_t n = strlen(pat);
+    for (int k = 0; k < NQ; k++) {
+        if (q >= 0 && k != q) continue;
+        for (int c = 0; c < m->nc[k]; c++) {
+            const char *t = m->cols[k][c];
+            if ((n && pat[n - 1] == '*') ? !strncmp(t, pat, n - 1) : !strcmp(t, pat)) P->thr[k][c] = v;
+        }
+    }
+}
+
+static void add_alias(meta_t *m, const char *k, int p) {
+    for (int i = 0; i < m->nalias; i++) if (!strcmp(m->alias_k[i], k)) { m->alias_v[i] = p; return; }
+    m->alias_k = (char **)realloc(m->alias_k, sizeof(char *) * (size_t)(m->nalias + 2));
+    m->alias_v = (int *)realloc(m->alias_v, sizeof(int) * (size_t)(m->nalias + 2));
+    m->alias_k[m->nalias] = xstrdup(k); m->alias_v[m->nalias] = p; m->nalias++;
+}
+
+static void add_kids_profile(arctag_t *h, const char *model_dir) {
+    meta_t *m = &h->m;
+    h->kids_prof_min = 0.9;
+    int have = -1, base = -1;
+    for (int p = 0; p < m->nprof; p++) { if (!strcmp(m->prof[p].name, "kids:kids")) have = p; if (!strcmp(m->prof[p].name, "assistant:assistant")) base = p; }
+    if (have < 0 && base < 0) return;
+    char *path = path_join(model_dir, "arctag_kids.json");
+    char *txt = read_file(path); free(path);
+    cJSON *j = txt ? cJSON_Parse(txt) : NULL; free(txt);
+    if (have < 0) {
+        m->prof = (profile_t *)realloc(m->prof, sizeof(profile_t) * (size_t)(m->nprof + 1));
+        profile_t *P = &m->prof[m->nprof], *B = &m->prof[base];
+        memset(P, 0, sizeof *P);
+        P->name = xstrdup("kids:kids"); P->ui = xstrdup("kids"); P->fine = xstrdup("kids"); P->dom = B->dom;
+        for (int q = 0; q < NQ; q++) {
+            P->thr[q] = (double *)calloc((size_t)m->nc[q] + 1, sizeof(double)); memcpy(P->thr[q], B->thr[q], sizeof(double) * (size_t)m->nc[q]);
+            P->valid[q] = (unsigned char *)calloc((size_t)m->nc[q] + 1, 1); memcpy(P->valid[q], B->valid[q], (size_t)m->nc[q]);
+        }
+        memcpy(P->head_thr, B->head_thr, sizeof P->head_thr);
+        cJSON *th = j ? cJSON_GetObjectItem(j, "thr") : NULL, *ht = j ? cJSON_GetObjectItem(j, "head_thr") : NULL;
+        if (cJSON_IsObject(th)) { for (cJSON *x = th->child; x; x = x->next) if (cJSON_IsNumber(x)) prof_set(m, P, x->string, x->valuedouble); }
+        else for (int i = 0; KIDS_THR[i].pat; i++) {
+            if (!strncmp(KIDS_THR[i].pat, "head:", 5)) { for (int f = 0; f < m->nfam; f++) if (!strcmp(m->fam[f].name, KIDS_THR[i].pat + 5)) P->head_thr[f] = KIDS_THR[i].v; }
+            else prof_set(m, P, KIDS_THR[i].pat, KIDS_THR[i].v);
+        }
+        for (cJSON *x = cJSON_IsObject(ht) ? ht->child : NULL; x; x = x->next)
+            for (int f = 0; f < m->nfam; f++) if (cJSON_IsNumber(x) && !strcmp(m->fam[f].name, x->string)) P->head_thr[f] = x->valuedouble;
+        have = m->nprof++;
+    }
+    cJSON *g = j ? cJSON_GetObjectItem(j, "guard") : NULL, *pm = g ? cJSON_GetObjectItem(g, "profanity_model_min") : NULL;
+    if (cJSON_IsNumber(pm)) h->kids_prof_min = pm->valuedouble;
+    cJSON_Delete(j);
+    add_alias(m, "kids", have); add_alias(m, "game", have);
 }
 
 /* ------------------------------------------------------------------ thresholds (profile + overrides) */
@@ -724,6 +795,8 @@ static void sort_by_p_desc(cJSON *arr) {                                  /* sta
     free(v);
 }
 
+static int guard_active(const arctag_t *h) { return h->guard > 0 || (h->guard < 0 && !strcmp(h->m.prof[h->prof].ui, "kids")); }
+
 /* utterance read-outs at row j (window-relative) */
 static cJSON *readouts(const arctag_t *h, const run_t *r, int row, int spk_slot) {
     cJSON *ro = cJSON_CreateObject();
@@ -738,7 +811,8 @@ static cJSON *readouts(const arctag_t *h, const run_t *r, int row, int spk_slot)
     append_all(act, top(h, r, Q_UTT, row, "discourse.assistant.", 1, NULL, NULL, NULL));
     cJSON_AddItemToObject(ro, "act", act);
     cJSON *saf = top(h, r, Q_UTT, row, "safety.", 20, NULL, NULL, NULL), *s2 = cJSON_CreateArray();
-    for (cJSON *x = saf->child; x; x = x->next)
+    if (guard_active(h)) { cJSON_Delete(s2); s2 = saf; saf = NULL; }   /* every column: guard_result rebuilds the list */
+    for (cJSON *x = saf ? saf->child : NULL; x; x = x->next)
         if (cJSON_GetArraySize(s2) < 6 && jget(x, "p") >= 0.5 * jget(x, "thr")) cJSON_AddItemToArray(s2, cJSON_Duplicate(x, 1));
     cJSON_Delete(saf);
     cJSON_AddItemToObject(ro, "safety", s2);
@@ -1289,6 +1363,8 @@ arctag_t *arctag_create_ex(const char *model_dir, const arctag_options *opt, cha
     p = path_join(model_dir, "arctag_meta.json");
     if (load_meta(h, p)) { free(p); goto fail; }
     free(p);
+    add_kids_profile(h, model_dir);
+    h->guard = -1;
     p = path_join(model_dir, "tokenizer.json");
     h->tok = arctok_load(p, h->err, sizeof h->err); free(p);
     if (!h->tok) goto fail;
@@ -1478,6 +1554,19 @@ int arctag_set_option(arctag_t *h, const char *key, const char *value) {
         else { set_err(h, "fine_auto must be on or off"); return -1; }
         return 0;
     }
+    if (!strcmp(key, "guard")) {
+        if (!strcmp(value, "on") || !strcmp(value, "1") || !strcmp(value, "true")) h->guard = 1;
+        else if (!strcmp(value, "off") || !strcmp(value, "0") || !strcmp(value, "false")) h->guard = 0;
+        else if (!strcmp(value, "auto") || !*value) h->guard = -1;
+        else { set_err(h, "guard must be auto, on or off"); return -1; }
+        return 0;
+    }
+    if (!strcmp(key, "command_context")) {
+        if (!strcmp(value, "on") || !strcmp(value, "1") || !strcmp(value, "true")) h->cmd_ctx = 1;
+        else if (!strcmp(value, "off") || !strcmp(value, "0") || !strcmp(value, "false") || !*value) h->cmd_ctx = 0;
+        else { set_err(h, "command_context must be on or off"); return -1; }
+        return 0;
+    }
     if (!strcmp(key, "emit")) return set_emit(h, value);
     if (!strcmp(key, "tags")) {
         for (int i = 0; i < h->ntagpre; i++) free(h->tagpre[i]);
@@ -1519,8 +1608,10 @@ static int apply_config_obj(arctag_t *h, cJSON *j) {
         } else if (!strcmp(k, "threads") || !strcmp(k, "max_ctx") || !strcmp(k, "stream_ctx")) {
             if (!cJSON_IsNumber(x)) { set_err(h, "config: %s must be a number", k); return -1; }
             snprintf(b, sizeof b, "%d", x->valueint); rc = arctag_set_option(h, k, b);
-        } else if (!strcmp(k, "fine_auto") || !strcmp(k, "stream_state")) {
+        } else if (!strcmp(k, "fine_auto") || !strcmp(k, "stream_state") || !strcmp(k, "command_context")) {
             rc = arctag_set_option(h, k, cJSON_IsTrue(x) ? "on" : "off");
+        } else if (!strcmp(k, "guard")) {
+            rc = arctag_set_option(h, k, cJSON_IsString(x) ? x->valuestring : cJSON_IsTrue(x) ? "on" : "off");
         } else if (!strcmp(k, "emit") || !strcmp(k, "tags")) {
             if (!cJSON_IsArray(x)) { set_err(h, "config: %s must be an array of strings", k); return -1; }
             char *s = join_strs(x); rc = arctag_set_option(h, k, cJSON_GetArraySize(x) || !strcmp(k, "tags") ? s : "all"); free(s);
@@ -1611,6 +1702,8 @@ char *arctag_info(arctag_t *h) {
     cJSON_AddNumberToObject(o, "max_ctx", h->max_ctx);
     cJSON_AddNumberToObject(o, "stream_ctx", h->stream_ctx);
     cJSON_AddBoolToObject(o, "fine_auto", h->fine_auto);
+    cJSON_AddStringToObject(o, "guard", h->guard < 0 ? (guard_active(h) ? "auto:on" : "auto:off") : h->guard ? "on" : "off");
+    cJSON_AddBoolToObject(o, "command_context", h->cmd_ctx);
     cJSON *em = cJSON_AddArrayToObject(o, "emit");
     for (int e = 0; e < N_EMIT; e++) if (h->emit[e]) cJSON_AddItemToArray(em, cJSON_CreateString(EMIT_N[e]));
     cJSON *tg = cJSON_AddArrayToObject(o, "tags");
@@ -1649,6 +1742,28 @@ static void add_readouts(cJSON *o, cJSON *ro) {
 static int has_cues(const arctag_t *h, int p) {
     for (int i = 0; i < h->m.ncues; i++) if (!strcmp(h->m.cues[i].ui, h->m.prof[p].ui)) return 1;
     return 0;
+}
+
+/* guard layer over a result: profanity spans of words [a0, n), then every utterance's safety list (src/guard.c) */
+static void guard_result(arctag_t *h, cJSON *res, const word_t *ws, int a0, int n) {
+    if (!guard_active(h)) return;
+    const char **wv = (const char **)malloc(sizeof(char *) * (size_t)(n + 1));
+    for (int i = 0; i < n; i++) wv[i] = ws[i].w;
+    double pthr = 0.5;
+    for (int f = 0; f < h->m.nfam; f++) if (!strcmp(h->m.fam[f].name, "safety.profanity")) pthr = h->head[f];
+    cJSON *spans = cJSON_GetObjectItem(res, "spans");
+    guard_spans(spans, wv, a0, n, h->kids_prof_min, pthr);
+    cJSON *ut = cJSON_GetObjectItem(res, "utterances"), *cur = cJSON_GetObjectItem(res, "current");
+    for (int k = 0; k < 2; k++) {
+        cJSON *first = k == 0 ? (ut ? ut->child : NULL) : (cJSON_IsObject(cur) ? cur : NULL);
+        for (cJSON *u = first; u; u = k == 0 ? u->next : NULL) {
+            int a = I_(u, "start"), b = I_(u, "end");
+            cJSON *all = cJSON_GetObjectItem(u, "safety");
+            if (!all || a < 0 || b > n) continue;
+            cJSON_ReplaceItemInObject(u, "safety", guard_utt(wv, a, b, spans, all, h->cmd_ctx, pthr));
+        }
+    }
+    free(wv);
 }
 
 /* offline tagging of words[0..n) with utterance starts us */
@@ -1732,6 +1847,7 @@ static char *tag_words_impl(arctag_t *h, word_t *ws, int n, unsigned char *us) {
     use_profile(h, base);
     free(h->keys); h->keys = saved_keys; h->nk = saved_nk; h->kcap = saved_cap;
     if (!ok) { cJSON_Delete(res); return NULL; }
+    guard_result(h, res, ws, 0, n);
     if (h->redact) { char *r = redact_text(h, ws, 0, n, spans); cJSON_AddStringToObject(res, "redacted_text", r); free(r); }
     filter_result(h, res);
     return print_free(res);
@@ -1894,6 +2010,7 @@ char *arctag_poll(arctag_t *h) {
         add_readouts(o, readouts(h, &r, W - 1, spk_slot_at(h->words, 0, n - 1)));
         cJSON_AddItemToObject(res, "current", o);
     } else cJSON_AddNullToObject(res, "current");
+    guard_result(h, res, h->words, a0, n);
     if (h->redact) { char *rt = redact_text(h, h->words, a0, n, spans); cJSON_AddStringToObject(res, "redacted_text", rt); free(rt); }
     run_free(h, &r); free(us);
     filter_result(h, res);
