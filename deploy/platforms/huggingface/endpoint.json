@@ -1,0 +1,20 @@
+{
+  "name": "arc-tagger",
+  "type": "protected",
+  "provider": {"vendor": "aws", "region": "us-east-1"},
+  "compute": {"accelerator": "cpu", "instanceType": "intel-spr", "instanceSize": "x1", "scaling": {"minReplica": 1, "maxReplica": 2}},
+  "model": {
+    "repository": "WhissleAI/arc-tagger",
+    "revision": "v0.4.1",
+    "task": "custom",
+    "framework": "custom",
+    "image": {
+      "custom": {
+        "url": "<registry>/arc-tagger:0.1.0",
+        "port": 8080,
+        "healthRoute": "/v1/health/ready",
+        "env": {"ARCTAG_WORKERS": "2"}
+      }
+    }
+  }
+}

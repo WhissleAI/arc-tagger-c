@@ -306,6 +306,13 @@ The server (`demo/server.py`, one pinned dependency: `websockets`) loads the sha
 to the static one (`build/libarctag.so` / `.dylib` / `arctag.dll`; turn it off with `-DARCTAG_BINDINGS_LIB=OFF`)
 through `ctypes`. [demo/README.md](demo/README.md) covers the flags, the tabs and the protocol.
 
+## Hosted service
+
+[`deploy/`](deploy/README.md) is a production server around the native backend (`arctag-serve`, C, no Python): `POST
+/v1/tags` (text, words, transcript segments, batches), `WS /v1/realtime`, SageMaker's `/ping` and `/invocations`, a
+distroless image, adapters for Hugging Face Inference Endpoints, SageMaker / AWS Marketplace and Snowflake, and a
+conformance run against `python/arctag_ref.py`.
+
 ## Parity
 
 | check | result |

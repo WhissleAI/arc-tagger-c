@@ -1,0 +1,24 @@
+# SPCS service specification for arctag-serve (bundled image)
+spec:
+  containers:
+    - name: arctag
+      image: /arc_db/arc/images/arc-tagger:0.1.0-v0.4.1
+      args: ["serve"]
+      env:
+        PORT: "8080"
+        ARCTAG_WORKERS: "4"
+        ARC_ACCESS_LOG: "0"
+      readinessProbe:
+        port: 8080
+        path: /v1/health/ready
+      resources:
+        requests:
+          cpu: 2
+          memory: 1G
+        limits:
+          cpu: 4
+          memory: 2G
+  endpoints:
+    - name: api
+      port: 8080
+      public: false
