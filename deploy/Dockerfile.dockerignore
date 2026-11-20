@@ -1,0 +1,11 @@
+# build context = the repository root; only what the image needs (BuildKit reads <Dockerfile>.dockerignore)
+*
+!include
+!src
+!third_party/cjson
+!deploy/Makefile
+!deploy/server
+!deploy/openapi.yaml
+!deploy/weights
+!LICENSE
+!NOTICE

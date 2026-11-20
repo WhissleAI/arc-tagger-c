@@ -1,0 +1,245 @@
+openapi: 3.1.0
+info:
+  title: Arc Tagger service (arctag-serve)
+  version: 0.1.0
+  summary: Streaming text tagger (entities, numbers, PII, profanity / toxicity, events, intent, dialogue act, safety, affect, roles). CPU, C.
+  description: |
+    Text, pre-split words or transcript segments in; spans, events and utterance read-outs out (the JSON of
+    `arctag_tag_text` / `arctag_tag_words` / `arctag_poll`, documented in docs/USAGE.md). Native C backend, no ONNX
+    Runtime, no Python, no network calls at run time. Also Amazon SageMaker's container contract (`GET /ping`,
+    `POST /invocations`, port 8080). English only.
+  license:
+    name: CC BY-NC 4.0 with the Whissle terms (commercial licences from Whissle Inc.)
+    url: https://github.com/WhissleAI/arc-tagger-c/blob/main/LICENSE
+servers:
+  - url: http://localhost:8080
+paths:
+  /v1/tags:
+    post:
+      operationId: createTags
+      summary: Tag text, words, transcript segments, or a batch of them
+      parameters:
+        - {name: domain, in: query, schema: {type: string}, description: text/plain bodies only}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/TagRequest'
+                - $ref: '#/components/schemas/BatchRequest'
+                - type: array
+                  description: a bare array = a batch
+                  items: {oneOf: [{type: string}, {$ref: '#/components/schemas/TagRequest'}]}
+          text/plain:
+            schema: {type: string}
+      responses:
+        '200':
+          description: Tagger output (one request) or {model, results} (a batch)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/TagResult'
+                  - type: object
+                    properties:
+                      model: {type: string}
+                      results: {type: array, items: {$ref: '#/components/schemas/TagResult'}}
+        '400': {$ref: '#/components/responses/Error'}
+        '415': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+  /v1/realtime:
+    get:
+      operationId: realtime
+      summary: Streaming tags over WebSocket (one tagger handle per session)
+      description: |
+        Text frames, JSON. Client: `{"type": "words", "words": [...], "from": k, "endpoint": true}` (append words or
+        revise from index k, then optionally close the utterance; a bare JSON array also appends),
+        `{"type": "text", "text": "...", "endpoint": true}`, `{"type": "endpoint"}`, `{"type": "poll"}`,
+        `{"type": "reset"}`, `{"type": "session.update", "session": {domain, asr, emit, tags, redact, thresholds, guard,
+        command_context}}`, `{"type": "session.close"}`.
+        Server: `session.created`, `tags.update` after every push (the `arctag_poll` object: `n_words`, `a0`,
+        `profile`, `spans` (replace your spans with end > a0), `events` (new), `utterances` (closed since the last
+        update), `current` (running read-out)), `session.updated`, `reset`, `error`.
+        Native backend: each update computes only the new words (a few ms per word).
+      parameters:
+        - {name: domain, in: query, schema: {type: string}}
+        - {name: asr, in: query, schema: {type: string}}
+        - {name: emit, in: query, schema: {type: string}}
+        - {name: redact, in: query, schema: {type: string}}
+      responses:
+        '101': {description: Switching Protocols}
+        '503': {$ref: '#/components/responses/Error'}
+  /health:
+    get: {operationId: health, summary: Liveness, responses: {'200': {$ref: '#/components/responses/Status'}}}
+  /v1/health/live:
+    get: {operationId: healthLive, summary: Liveness (NIM-style path), responses: {'200': {$ref: '#/components/responses/Status'}}}
+  /v1/health/ready:
+    get:
+      operationId: healthReady
+      summary: Readiness (model loaded)
+      responses: {'200': {$ref: '#/components/responses/Status'}, '503': {$ref: '#/components/responses/Status'}}
+  /ping:
+    get:
+      operationId: sagemakerPing
+      summary: SageMaker health check (= readiness)
+      responses: {'200': {$ref: '#/components/responses/Status'}, '503': {$ref: '#/components/responses/Status'}}
+  /invocations:
+    post:
+      operationId: sagemakerInvocations
+      summary: SageMaker inference, routed on Content-Type
+      description: |
+        `application/json`: one TagRequest, or a batch (`{"instances": [...]}`, `{"inputs": [...]}` or a bare array).
+        `application/jsonlines`: one request per line, one result per line (batch transform, `SplitType=Line`).
+        `text/plain`: the text. Audio types are refused with 415 (use Arc Transcriber, or the combined image).
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {type: object}}
+          application/jsonlines: {schema: {type: string}}
+          text/plain: {schema: {type: string}}
+      responses:
+        '200': {description: Result(s)}
+        '400': {$ref: '#/components/responses/Error'}
+        '415': {$ref: '#/components/responses/Error'}
+  /execution-parameters:
+    get:
+      operationId: sagemakerExecutionParameters
+      summary: SageMaker batch transform defaults
+      responses: {'200': {description: OK}}
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: The loaded model (OpenAI list shape, plus the handle's arctag_info)
+      responses: {'200': {description: OK}}
+  /v1/models/{id}:
+    get:
+      operationId: getModel
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      responses: {'200': {description: OK}, '404': {$ref: '#/components/responses/Error'}}
+components:
+  responses:
+    Error:
+      description: Error envelope
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  message: {type: string}
+                  type: {type: string}
+                  code: {type: integer}
+    Status:
+      description: Status
+      content: {application/json: {schema: {type: object, properties: {status: {type: string}}}}}
+  schemas:
+    Options:
+      type: object
+      description: Per-request options (the config keys that do not reload the model). precision, backend, threads, max_ctx, stream_ctx are fixed at start (env ARCTAG_*) and refused per request with 400.
+      properties:
+        domain:
+          type: string
+          description: auto | talk | meeting | court | assistant | sports | news | kids | a fine domain (nba nhl nfl soccer cricket court_appellate court_trial assistant_noisy stream_chat)
+        asr: {type: string, description: 'word source: unknown, human, stock_rnnt, arc_transcriber, nemotron35, deepgram, final_only, web'}
+        emit: {description: output sections, oneOf: [{type: string}, {type: array, items: {type: string}}]}
+        tags: {description: tag prefixes to keep, oneOf: [{type: string}, {type: array, items: {type: string}}]}
+        redact: {description: 'off | mask | a policy "phone=mask,name=mask,contact=off"', oneOf: [{type: string}, {type: object}]}
+        thresholds: {type: object, additionalProperties: {type: number}}
+        fine_auto: {type: boolean}
+        guard: {type: string, enum: [auto, on, off]}
+        command_context: {type: boolean}
+        config: {type: object, description: the same keys, nested}
+    Word:
+      oneOf:
+        - type: string
+        - type: object
+          required: [w]
+          properties:
+            w: {type: string}
+            t0: {type: number}
+            t1: {type: number}
+            conf: {type: number}
+            spk: {type: [string, integer]}
+            final: {type: boolean}
+            eou: {type: boolean, description: the utterance ends after this word}
+    Segment:
+      type: object
+      description: A transcript segment (Arc Transcriber verbose_json segments work as they are). Without words, the text is split on spaces and the segment's time spread over them. Each segment ends an utterance.
+      properties:
+        text: {type: string}
+        start: {type: number}
+        end: {type: number}
+        speaker: {type: [string, integer]}
+        words:
+          type: array
+          items:
+            type: object
+            properties:
+              word: {type: string}
+              start: {type: number}
+              end: {type: number}
+              confidence: {type: number}
+              speaker: {type: [string, integer]}
+    TagRequest:
+      allOf:
+        - $ref: '#/components/schemas/Options'
+        - type: object
+          description: exactly one of text, words, segments
+          properties:
+            text: {type: string, description: 'whitespace words; a word ending in . ? ! closes an utterance'}
+            words: {type: array, items: {$ref: '#/components/schemas/Word'}}
+            segments: {type: array, items: {$ref: '#/components/schemas/Segment'}}
+    BatchRequest:
+      allOf:
+        - $ref: '#/components/schemas/Options'
+        - type: object
+          description: batch-level options apply to every item that does not set its own
+          properties:
+            inputs: {type: array, items: {oneOf: [{type: string}, {$ref: '#/components/schemas/TagRequest'}]}}
+            instances: {type: array, items: {oneOf: [{type: string}, {$ref: '#/components/schemas/TagRequest'}]}}
+    TagResult:
+      type: object
+      description: docs/USAGE.md "Output JSON"
+      properties:
+        model: {type: string}
+        profile: {type: string}
+        n_words: {type: integer}
+        words: {type: array, items: {type: string}}
+        spans:
+          type: array
+          items:
+            type: object
+            properties:
+              type: {type: string, examples: [safety.pii.phone_number, entity.mention.person, entity.number.money]}
+              family: {type: string}
+              start: {type: integer}
+              end: {type: integer}
+              text: {type: string}
+              score: {type: number}
+              thr: {type: number}
+              src: {type: string}
+        events: {type: array, items: {type: object}}
+        utterances:
+          type: array
+          items:
+            type: object
+            properties:
+              start: {type: integer}
+              end: {type: integer}
+              text: {type: string}
+              intent: {type: array, items: {$ref: '#/components/schemas/Readout'}}
+              act: {type: array, items: {$ref: '#/components/schemas/Readout'}}
+              safety: {type: array, items: {$ref: '#/components/schemas/Readout'}}
+              emotion: {type: array, items: {$ref: '#/components/schemas/Readout'}}
+              role: {type: array, items: {$ref: '#/components/schemas/Readout'}}
+        redacted_text: {type: string}
+    Readout:
+      type: object
+      properties:
+        tag: {type: string}
+        p: {type: number}
+        thr: {type: number}
+        'on': {type: boolean}
