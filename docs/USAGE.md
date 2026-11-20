@@ -10,7 +10,7 @@ int8 variant is covered in [int8.md](int8.md).
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 # or, native backend only (no ONNX Runtime needed):
 # cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DARCTAG_WITH_ORT=OFF && cmake --build build -j
-HF_TOKEN=hf_... ./scripts/fetch_model.sh           # -> model/ (arctag.onnx, arctag_int8.onnx, arctag_meta.json, tokenizer.json)
+./scripts/fetch_model.sh                           # -> model/ (arctag.onnx, arctag_int8.onnx, arctag_meta.json, tokenizer.json)
 ctest --test-dir build --output-on-failure
 ```
 

@@ -14,7 +14,7 @@ With a Deepgram key, the Live tab does the same for your microphone or a browser
 ## Requirements
 
 - What the library needs: CMake, a C compiler and the prebuilt ONNX Runtime (`scripts/download_onnxruntime.sh`).
-- The model files in `./model`, from `scripts/fetch_model.sh` (needs `HF_TOKEN`, see the [main README](../README.md#model-files-and-the-hugging-face-token)).
+- The model files in `./model`, from `scripts/fetch_model.sh` (no token needed, see the [main README](../README.md#model-files)).
 - Python 3.9 or newer, plus one package: `websockets` (pinned in [`requirements.txt`](requirements.txt)).
 - Optional: a [Deepgram](https://deepgram.com) API key for the Live tab.
 
@@ -22,14 +22,14 @@ With a Deepgram key, the Live tab does the same for your microphone or a browser
 
 ```bash
 ./scripts/download_onnxruntime.sh                       # once
-HF_TOKEN=hf_... ./scripts/fetch_model.sh                # once: ./model
+./scripts/fetch_model.sh                                # once: ./model
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 python3 -m pip install -r demo/requirements.txt         # once
 python3 demo/server.py                                  # http://localhost:8080
 ```
 
-`demo/run.sh` does all of this in one go. It skips the steps that are already done, and it fetches the model only when
-`./model` is empty and `HF_TOKEN` is set. Arguments after `run.sh` go to the server, for example
+`demo/run.sh` does all of this in one go. It skips the steps that are already done, and it fetches the model when
+`./model` is empty. Arguments after `run.sh` go to the server, for example
 `demo/run.sh --int8 --port 9000`.
 
 The build makes the static library and a shared copy for language bindings: `build/libarctag.so` (Linux),

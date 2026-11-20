@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Download the C-library model files of Arc Tagger v0.4.1 (onnx/ folder of the private Hugging Face repo) into ./model (or $1).
-#   HF_TOKEN=hf_... scripts/fetch_model.sh [DEST_DIR]
+# Download the C-library model files of Arc Tagger v0.4.1 (onnx/ folder of the public Hugging Face repo) into ./model (or $1).
+#   scripts/fetch_model.sh [DEST_DIR]
 # Env:
 #   HF_REPO        default WhissleAI/arc-tagger
+#   HF_TOKEN       optional: sent when set (a private fork or mirror of the repo)
 #   HF_REVISION    default v0.4.1 (a tag, branch or commit of the model repo)
 #   ARCTAG_FETCH   fp32 | int8 | all (default all): which ONNX graphs to fetch
 #   ARCTAG_INT8_URL  optional URL of arctag_int8.onnx when it is not in the HF repo (e.g. a GitHub release asset;
@@ -14,16 +15,14 @@ REV="${HF_REVISION:-v0.4.1}"
 WHICH="${ARCTAG_FETCH:-all}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${1:-$ROOT/model}"
-if [ -z "${HF_TOKEN:-}" ]; then
-  echo "HF_TOKEN is not set (the model repo is private). Create a read token at https://huggingface.co/settings/tokens" >&2
-  exit 1
-fi
 case "$WHICH" in fp32|int8|all) ;; *) echo "ARCTAG_FETCH must be fp32, int8 or all" >&2; exit 2;; esac
 mkdir -p "$DEST"
 
 hf_get() {  # hf_get FILE -> 0 on success
   local url="https://huggingface.co/${REPO}/resolve/${REV}/onnx/$1"
-  curl -fsSL --retry 3 -H "Authorization: Bearer ${HF_TOKEN}" -o "$DEST/$1.part" "$url" && mv "$DEST/$1.part" "$DEST/$1"
+  local auth=()
+  [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${HF_TOKEN}")
+  curl -fsSL --retry 3 ${auth[@]+"${auth[@]}"} -o "$DEST/$1.part" "$url" && mv "$DEST/$1.part" "$DEST/$1"
 }
 
 files=(arctag_meta.json tokenizer.json SHA256SUMS)
