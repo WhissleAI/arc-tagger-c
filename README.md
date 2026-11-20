@@ -30,7 +30,6 @@ matches this repo's Python reference bit for bit, and the native backend makes t
 ```bash
 git clone git@github.com:WhissleAI/arc-tagger-c.git && cd arc-tagger-c
 ./scripts/download_onnxruntime.sh              # prebuilt ONNX Runtime 1.20.1 -> third_party/onnxruntime (optional, see Backends)
-export HF_TOKEN=hf_xxx                         # read token with access to the private model repo
 ./scripts/fetch_model.sh                       # -> ./model (arctag.onnx, arctag_int8.onnx, arctag_meta.json, tokenizer.json)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ctest --test-dir build --output-on-failure
@@ -60,9 +59,9 @@ copies `onnxruntime.dll` next to the executables. For the model, run `scripts/fe
 [docs/USAGE.md](docs/USAGE.md) covers every tool, the config keys and the full output schema. [docs/int8.md](docs/int8.md)
 covers the int8 variant.
 
-## Model files and the Hugging Face token
+## Model files
 
-The model is in the **private** Hugging Face repo `WhissleAI/arc-tagger`. The C library needs only its `onnx/` folder:
+The model is in the public Hugging Face repo [`WhissleAI/arc-tagger`](https://huggingface.co/WhissleAI/arc-tagger). The C library needs only its `onnx/` folder:
 
 | file | what |
 |---|---|
@@ -72,16 +71,14 @@ The model is in the **private** Hugging Face repo `WhissleAI/arc-tagger`. The C 
 | `onnx/tokenizer.json` | byte-level BPE (8k) tokenizer, read directly by the C tokenizer |
 | `onnx/SHA256SUMS` | checksums, verified by `fetch_model.sh` |
 
-To fetch them:
-
-1. Get read access to the repo, then create a **read** token at <https://huggingface.co/settings/tokens>.
-2. Run `export HF_TOKEN=hf_...` and `./scripts/fetch_model.sh [DEST]`.
+To fetch them, run `./scripts/fetch_model.sh [DEST]`. No Hugging Face account or token is needed.
 
 `fetch_model.sh` reads these environment variables:
 
 | variable | default | meaning |
 |---|---|---|
 | `HF_REPO` | `WhissleAI/arc-tagger` | repo |
+| `HF_TOKEN` | | optional; sent when set (for a private fork or mirror) |
 | `HF_REVISION` | `v0.4.1` | tag, branch or commit |
 | `ARCTAG_FETCH` | `all` | `fp32`, `int8` or `all` |
 | `ARCTAG_INT8_URL` | | another location for the int8 graph |
