@@ -51,20 +51,7 @@ On the made-up test texts (`int8_agreement`, the 120 parity cases): all items F1
 the same on both backends (pass at F1 >= 0.90 and |dp| <= 0.25).
 
 On the Whissle internal held-out test set (168,781 words, 1,187 windows, each run with its ASR source), at the model's
-thresholds:
-
-**Raw outputs.** Max |dp| per output over all words and columns, and on/off flips at the profile thresholds:
-
-| output | max abs dp | flips |
-|---|---|---|
-| frame (content state) | 0.150 | 9,709 |
-| span_beg / span_in / span_end | 0.129 / 0.125 / 0.194 | 339 / 436 / 554 |
-| ev_at / ev_imm / ev_rec | 0.075 / 0.051 / 0.056 | 179 / 11 / 286 |
-| utt (intent / act / safety / affect) | 0.112 | 11,005 |
-| speaker | 0.081 | 851 |
-| item | 0.044 | 293 |
-| span output (entity / number / PII / profanity / toxicity, type / boundary) | 0.04-0.14 | |
-| verifier (ver_m / ver_e, logits) | 0.21 / 0.26 | |
+thresholds, the largest probability change per output is 0.04-0.19.
 
 **Decoded output.** F1 between the fp32 and int8 items:
 
