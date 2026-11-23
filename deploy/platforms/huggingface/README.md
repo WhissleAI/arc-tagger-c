@@ -1,4 +1,4 @@
-# Hugging Face Inference Endpoints (custom container)
+# Hugging Face Inference Endpoints
 
 The endpoint downloads the selected model repository to `/repository`; arctag-serve finds the model in
 `/repository/onnx` (the layout of `WhissleAI/arc-tagger`), so the **runtime** image needs no baked weights.
@@ -15,5 +15,4 @@ The endpoint downloads the selected model repository to `/repository`; arctag-se
 
 3. `curl -s https://<endpoint>.endpoints.huggingface.cloud/v1/tags -H "Authorization: Bearer $HF_TOKEN" -H 'Content-Type: application/json' -d '{"text": "..."}'`
 
-Check WebSocket support on your endpoint type before relying on `/v1/realtime`. `endpoint.json` follows the Inference
-Endpoints API's custom-image fields as documented at the time of writing; check them against the current reference.
+Open items (WebSocket support, `endpoint.json` field names): [platforms/README.md](../README.md#hugging-face).

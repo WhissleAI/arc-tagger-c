@@ -1,198 +1,141 @@
 # Using arctag
 
-Commands, configs and the output JSON of the C library. The API is in [`include/arctag.h`](../include/arctag.h), and the
-int8 variant is covered in [int8.md](int8.md).
+Tools, the C API, configs and the output JSON. The header is [`include/arctag.h`](../include/arctag.h).
 
 ## Build and model
 
 ```sh
-./scripts/download_onnxruntime.sh                  # prebuilt ONNX Runtime 1.20.1 -> third_party/onnxruntime
+./scripts/download_onnxruntime.sh        # ONNX Runtime 1.20.1 -> third_party/onnxruntime
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-# or, native backend only (no ONNX Runtime needed):
-# cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DARCTAG_WITH_ORT=OFF && cmake --build build -j
-./scripts/fetch_model.sh                           # -> model/ (arctag.onnx, arctag_int8.onnx, arctag_meta.json, tokenizer.json)
+# native backend only: add -DARCTAG_WITH_ORT=OFF and skip the download
+./scripts/fetch_model.sh                 # -> model/
 ctest --test-dir build --output-on-failure
 ```
 
-`fetch_model.sh` reads these environment variables:
+macOS: the download script picks `osx-arm64` or `osx-x86_64` (or pass one, e.g. `osx-universal2`). Windows: use
+`scripts/download_onnxruntime.ps1`; the build copies `onnxruntime.dll` next to the executables.
+
+`fetch_model.sh [DEST]` reads:
 
 | variable | default | meaning |
 |---|---|---|
 | `HF_REPO` | `WhissleAI/arc-tagger` | Hugging Face repo |
 | `HF_REVISION` | `v0.4.1` | tag, branch or commit |
+| `HF_TOKEN` | | optional (for a private mirror) |
 | `ARCTAG_FETCH` | `all` | `fp32`, `int8` or `all` |
-| `ARCTAG_INT8_URL` | | where to get `arctag_int8.onnx` if the HF repo does not have it |
+| `ARCTAG_INT8_URL` | | another location for the int8 graph |
 
-All files are checked against `SHA256SUMS`.
+If the int8 graph is missing, the script installs the fp32 files and the int8 tests report as skipped.
 
-A model directory holds:
-
-- `arctag.onnx` (fp32);
-- `arctag_int8.onnx` (weight-only int8, optional);
-- `arctag_meta.json` (ontology read-outs, per-domain thresholds, decoding constants);
-- `tokenizer.json`.
+**Versions.** Library 0.5.0 reads model release v0.4.1 (`fetch_model.sh` default). Files from another release can fail
+to load or decode differently, because read-out columns and thresholds live in `arctag_meta.json`.
 
 ## Backends
 
-Two backends run the model from the same files:
+| | native (default) | ONNX Runtime |
+|---|---|---|
+| dependencies | none (libc, libm) | ONNX Runtime 1.20.1 |
+| streaming | each poll computes only new or revised words | each poll re-runs the last `stream_ctx` words |
+| threads | one per handle | `threads` intra-op threads |
+| output | same decisions as the Python reference; scores within 1e-4 | bit-equal to the Python reference |
 
-- `native` (default): plain C, one thread per handle. Streaming polls compute only the words added or revised since the
-  last poll, so a per-word poll costs a few ms (see the benchmark in [int8.md](int8.md#speed-and-memory)). Loads in
-  well under 200 ms.
-- `onnxruntime`: ONNX Runtime 1.20.1, `threads` intra-op threads. Bit-equal to the Python reference. Each poll re-runs
-  the last `stream_ctx` words (about 150-200 ms per poll at 256 on one thread).
-
-Both make the same decisions; scores differ by about 1e-4 at most. Choose one with:
-
-| where | how |
-|---|---|
-| C, at load | `arctag_options o; arctag_options_init(&o); o.backend = ARCTAG_BACKEND_ONNXRUNTIME;` then `arctag_create_ex` |
-| C, later | `arctag_set_option(h, "backend", "onnxruntime")` (reloads the model; the stream is kept) |
-| config | `"backend": "native"` or `"onnxruntime"` |
-| tools and server | `--backend native` / `--backend onnxruntime` |
-| environment | `ARCTAG_BACKEND=onnxruntime`, used when the options leave the backend at its default |
-
-`arctag_info` reports `backend`, `weights` (`fp32`, `int8`, or `int8-folded` when the native backend converted a
-dynamically quantised file, such as the int8 file of model releases up to v0.4.0, to float at load) and, for the native backend, `kernels` (`avx2`, `neon` or `scalar`) and
-`stream_state`.
-
-The native backend checks the model file when it loads it (every table's shape and every index range) and refuses a
-truncated or corrupted file with a message, without crashing. AVX2 kernels are used only when the CPU has them.
+Pick one with `arctag_options.backend`, `arctag_set_option(h, "backend", ...)` (reloads the model), `"backend"` in a
+config, `--backend native|onnxruntime` on the tools, or `ARCTAG_BACKEND=onnxruntime`. The native backend checks the
+model file at load and refuses a truncated or corrupted one with a message. Speed and memory: [int8.md](int8.md#speed-and-memory).
 
 ## Command-line tools
 
 All tools take `-m MODEL_DIR` (default `$ARCTAG_MODEL_DIR` or `model`), `-c CONFIG.json`, `--int8` / `--fp32` and
-`--backend native|onnxruntime`.
-Options given on the command line are applied after the config.
+`--backend`. Command-line options apply after the config.
 
-| tool | what it does | example |
+| tool | does | example |
 |---|---|---|
-| `arctag_cli` | tags one text or word array and prints the JSON | `arctag_cli -d meeting "Let's ship it Friday. Dana owns the release notes."` |
-| `arctag_cli --stream` | feeds words one at a time through push / poll and prints every poll | `echo "goal for Arsenal!" \| arctag_cli -d soccer --stream` |
-| `batch_tag` | one document per line in, one JSON result per line out (JSON Lines), plus ms/word on stderr | `batch_tag -c configs/news.json examples/data/news.txt > out.jsonl` |
-| `stream_asr` | drives the streaming API from an ASR message stream (interim / final / endpoint) | `stream_asr -c configs/contact_center.json examples/data/asr_stream.jsonl` |
-| `redact` | PII / profanity redaction, line by line | `redact --policy phone=mask,email=mask,name=mask examples/data/pii.txt` |
-| `vertical_run` | runs one vertical config over an input and prints a report | `vertical_run configs/legal.json examples/data/court.txt` |
-| `compare_precision` | fp32 and int8 side by side: load time, ms/word, items that differ | `compare_precision examples/data/docs.txt` |
-| `bench` | load time, streaming per-word latency p50 / p95, batch ms/word, peak RSS (`--model-file F` for another .onnx, `--stream-state on\|off`) | `bench --backend native --int8 -t 1 examples/data/*.txt` |
-| `arctag_server` | JSON over stdin/stdout or HTTP, one stream per server | `arctag_server -c configs/voice_assistant.json --port 8080` |
+| `arctag_cli` | tags one text or word array | `arctag_cli -d meeting "Dana owns the release notes."` |
+| `arctag_cli --stream` | feeds words one at a time through push / poll | `echo "goal for Arsenal!" \| arctag_cli -d soccer --stream` |
+| `batch_tag` | one document per line in, JSON Lines out | `batch_tag -c configs/news.json examples/data/news.txt` |
+| `stream_asr` | drives the streaming API from ASR messages | `stream_asr -c configs/contact_center.json examples/data/asr_stream.jsonl` |
+| `redact` | redaction, line by line | `redact --policy phone=mask,email=mask examples/data/pii.txt` |
+| `vertical_run` | runs one config over an input and prints a report | `vertical_run configs/legal.json examples/data/court.txt` |
+| `compare_precision` | fp32 and int8 side by side | `compare_precision examples/data/docs.txt` |
+| `bench` | load time, per-word latency, batch speed, peak RSS | `bench --backend native --int8 -t 1 examples/data/*.txt` |
+| `arctag_server` | minimal JSON server, one stream | `arctag_server -c configs/voice_assistant.json --port 8090` |
 
-`arctag_cli` flags:
+`arctag_cli` flags: `-d DOMAIN`, `-a ASR`, `-t THREADS`, `--redact POLICY`, `--emit SECTIONS`, `--tags PREFIXES`,
+`--thr PATTERN=VALUE` (repeatable), `--words` (input is a JSON word array), `--info`.
 
-- `-d DOMAIN`, `-a ASR`, `-t THREADS`;
-- `--redact POLICY`, `--emit SECTIONS`, `--tags PREFIXES`;
-- `--thr PATTERN=VALUE` (repeatable);
-- `--words` (the input is a JSON word array);
-- `--info` (print the handle description).
+`arctag_server` routes: `POST /tag`, `POST /push`, `GET|POST /poll`, `POST /reset`, `POST /config`, `GET /info`,
+`GET /health`; `--stdin` reads one JSON request per line. For production use [deploy/](../deploy/README.md).
 
-`arctag_server` endpoints:
-
-| endpoint | body / response |
-|---|---|
-| `POST /tag` | raw text, or `{"text", "domain"}` |
-| `POST /push` | push-words JSON |
-| `GET` or `POST /poll` | the poll result |
-| `POST /reset` | resets the stream |
-| `POST /config` | a config object |
-| `GET /info` | the handle description |
-| `GET /health` | health check |
-
-With `--stdin` the server reads one JSON request per line (`{"op": "tag" | "tag_words" | "push" | "poll" | "reset" |
-"set" | "config" | "info", ...}`).
-
-## C API in five calls
+## C API
 
 ```c
 arctag_options o; arctag_options_init(&o);
-o.precision = ARCTAG_INT8;                                      /* or leave the defaults: fp32, native backend */
-arctag_t *h = arctag_create_ex("model", &o, err, sizeof err);    /* or arctag_create_from_config("model", "configs/legal.json", ...) */
+o.precision = ARCTAG_INT8;                                     /* default fp32, native backend */
+arctag_t *h = arctag_create_ex("model", &o, err, sizeof err);   /* or arctag_create_from_config(...) */
 arctag_set_option(h, "domain", "meeting");
 char *json = arctag_tag_text(h, "Dana will send the notes by Friday.");
-/* ... */ arctag_free_str(json); arctag_destroy(h);
+arctag_free_str(json);
+
+arctag_push_words(h, "[{\"w\":\"call\",\"t0\":0.1,\"t1\":0.3,\"spk\":\"A\"}, \"me\"]");    /* append */
+arctag_push_words(h, "{\"words\":[\"tomorrow.\"],\"from\":2,\"endpoint\":true}");      /* revise words[2:], close */
+char *p = arctag_poll(h);   /* spans with end > a0 replace yours; new events; closed utterances */
+arctag_free_str(p);
+arctag_destroy(h);
 ```
 
-Streaming looks like this:
-
-```c
-arctag_push_words(h, "[{\"w\":\"call\",\"t0\":0.1,\"t1\":0.3,\"spk\":\"A\"}, \"me\"]");      /* append */
-arctag_push_words(h, "{\"words\":[\"tomorrow.\"],\"from\":2,\"endpoint\":true}");        /* revise words[2:], close the utterance */
-char *p = arctag_poll(h);   /* spans with end > a0 replace yours; new events; utterances closed since the last poll */
-```
-
-A handle is not thread-safe. Use one handle per stream or thread. Handles share nothing, so for N streams load N handles.
-A native handle with the weight-only int8 file costs about 26 MB, with fp32 about 72 MB.
-
-## Configs
-
-A config is a JSON object. A file under `configs/` can be loaded with `arctag_create_from_config`, `-c` or
-`POST /config`, and a JSON string can be applied with `arctag_apply_config`. Unknown keys are an error. Keys starting
-with `_`, and `name`, `use_case`, `description`, `vertical`, `notes`, are ignored.
-
-| key | value |
+| function | |
 |---|---|
-| `model_dir` | model directory relative to the config file (used when `model_dir` is NULL) |
-| `backend` | `"native"` (default) / `"onnxruntime"` |
-| `precision` | `"fp32"` / `"int8"` |
-| `threads` | ONNX Runtime intra-op threads (0 = ORT default); the native backend uses one thread |
-| `mode` | `"batch"` / `"streaming"`: informational for the library, read by `vertical_run` to pick the API |
-| `domain` | a profile (`auto talk meeting court assistant sports news`), a fine domain (`nba nhl nfl soccer cricket court_appellate court_trial assistant_noisy stream_chat`) or `"ui:fine"` |
-| `asr` | where the words come from (`unknown human stock_rnnt arc_transcriber nemotron35 deepgram final_only web`) |
-| `fine_auto` | `true` (default): inside `sports` / `court`, switch the fine domain from lexicon cues the way the Python package does |
-| `max_ctx`, `stream_ctx` | words per model pass for `tag_text` (2048), and words of context the stream keeps (256; ONNX Runtime re-runs them per poll) |
-| `stream_state` | native backend: `true` (default) carries the state from poll to poll; `false` re-runs the window on every poll (same output, slower) |
-| `emit` | output sections to keep: `entity number pii profanity toxicity events intent act safety emotion arousal valence intensity role item state` (`[]` = all) |
-| `tags` | tag prefixes to keep (`[]` = all) |
-| `thresholds` | `{PATTERN: value}` overrides, applied on top of the domain's thresholds (see below); replaces earlier overrides |
-| `redact` | `"off"`, `"mask"` (all PII categories except public `contact`, plus profanity / toxicity) or `{"mode": "mask", "policy": {CATEGORY: "mask" / "tag" / "off"}}` |
+| `arctag_create`, `arctag_create_ex`, `arctag_create_from_config` | load (defaults / options / a config file) |
+| `arctag_apply_config`, `arctag_set_option` | apply a JSON config string; set one option |
+| `arctag_tag_text`, `arctag_tag_words` | tag a whole text (`. ? !` end an utterance) or pre-split words |
+| `arctag_push_words`, `arctag_poll` | streaming: append or revise (`from`), `endpoint`; get the update |
+| `arctag_reset`, `arctag_info`, `arctag_last_error`, `arctag_version` | |
+| `arctag_free_str`, `arctag_destroy` | every returned string is malloc'd JSON |
 
-Threshold patterns can take these forms:
+A handle is not thread-safe: use one per stream or thread. Native handles cost about 26 MB (int8) or 72 MB (fp32);
+ONNX Runtime handles about 118 MB, and a full 2048-word pass peaks near 1 GB (lower `max_ctx`).
 
-- an exact tag, such as `safety.pii.request`;
-- a prefix ending in `*`, such as `event.sports.*`;
-- any of the above with `@readout` added to limit it to one read-out (`frame span_beg span_in span_end ev_at ev_imm
-  ev_rec utt speaker item`), such as `discourse.intent.*@utt`;
-- `head:FAMILY`, the score threshold of a span-head family (`entity.number entity.mention safety.pii safety.profanity
-  safety.toxicity`).
+**Words** are a string or `{"w", "t0", "t1", "conf", "spk", "final", "eou"}` (only `w` required; `word` / `text`,
+`start` / `end`, `confidence`, `speaker` also accepted). Times, confidences and speaker ids improve the read-outs;
+speaker roles need `spk`.
 
-A family wildcard such as `safety.pii.*` also sets that family's span-head threshold. A value above 1 turns the tag off,
-and a value of 0 makes it always on.
+## Options and configs
 
-Redaction categories:
+Options go through `arctag_set_option` or the same keys in a config (JSON; files in [configs/](../configs/README.md)).
+Unknown keys are an error; keys starting with `_`, and `name`, `use_case`, `description`, `vertical`, `notes`, are
+ignored.
 
-| category | covers |
-|---|---|
-| `phone` | `safety.pii.phone_number` |
-| `email` | `safety.pii.email` |
-| `address` | `safety.pii.street_address` |
-| `card` | `safety.pii.card_account_number` |
-| `gov_id` | `safety.pii.gov_id` |
-| `dob` | `safety.pii.date_of_birth` |
-| `name` | `safety.pii.private_name` |
-| `handle` | `safety.pii.url_handle` |
-| `contact` | `safety.pii.public_contact` |
-| `profanity` | `safety.profanity.*` |
-| `toxicity` | `safety.toxicity.*` |
+| key | values | default |
+|---|---|---|
+| `domain` | `auto`, `talk`, `meeting`, `court`, `assistant`, `sports`, `news`, `kids`; a fine domain (`nba` `nhl` `nfl` `soccer` `cricket` `court_appellate` `court_trial` `assistant_noisy` `stream_chat`); or `ui:fine` | `auto` |
+| `asr` | `unknown`, `human`, `stock_rnnt`, `arc_transcriber`, `nemotron35`, `deepgram`, `final_only`, `web` | `unknown` |
+| `backend`, `precision`, `threads` | `native` / `onnxruntime`; `fp32` / `int8`; ONNX Runtime threads (all reload the model) | `native`, `fp32`, 0 |
+| `fine_auto` | inside `sports` / `court`, pick the fine domain from lexicon cues | on |
+| `emit` | sections: `entity number pii profanity toxicity events intent act safety emotion arousal valence intensity role item state` | all |
+| `tags` | tag prefixes to keep | all |
+| `redact` | `off`, `mask`, or a policy (below) | `off` |
+| `thresholds` / `thr:PATTERN` | threshold overrides (below); `thr_reset` drops them | |
+| `max_ctx`, `stream_ctx` | words per `tag_text` pass; words of context a stream keeps | 2048, 256 |
+| `stream_state` | native: carry state between polls (`off` re-runs the window: same output, slower) | on |
+| `guard`, `command_context` | kids guard layer ([KIDS.md](KIDS.md)) | `auto`, `off` |
+| `model_dir`, `mode` | config only: model directory relative to the config; `batch` / `streaming` (read by `vertical_run`) | |
 
-A masked span becomes `[PHONE]`, `[EMAIL]`, `[ADDRESS]`, `[CARD]`, `[GOV_ID]`, `[DOB]`, `[NAME]`, `[HANDLE]`,
-`[CONTACT]`, `[PROFANITY]` or `[TOXIC]`.
+The domain is a model input: it sets which tags are valid and selects thresholds. `auto` runs the generic profile,
+where sports events or items can fire on unrelated text. Set the domain when you know it, or drop sections with `emit`.
 
-### Shipped configs
+**Threshold patterns**: an exact tag (`safety.pii.request`), a prefix (`event.sports.*`), either with `@readout`
+(`discourse.intent.*@utt`), or `head:FAMILY` for a span-head family. A value above 1 turns a tag off; 0 makes it
+always on.
 
-| config | vertical | precision / threads | mode | domain | emits | overrides | redaction |
-|---|---|---|---|---|---|---|---|
-| `voice_assistant.json` | voice assistant | fp32 / 2 | streaming, ctx 128 | assistant | entity number pii events intent act safety | `safety.jailbreak.attempt` 0.45 | off |
-| `contact_center.json` | contact center | fp32 / 2 | streaming, ctx 256 | talk | pii entity number profanity toxicity events intent act safety emotion valence role | `safety.scam.*` 0.4, `safety.pii.request` 0.45, `safety.threat.escalation` 0.4 | mask PII + profanity, tag contacts / toxicity |
-| `trust_safety_gaming.json` | trust and safety, gaming chat | fp32 / 2 | streaming, ctx 128 | stream_chat | profanity toxicity pii entity safety intent emotion arousal valence intensity | `safety.toxicity.threat_violence` 0.4, `safety.threat.escalation` 0.35, `safety.child.*` 0.3, `safety.crisis.self_harm` 0.3, `safety.solicitation.dating_romantic` 0.4 | mask profanity, toxicity, private PII |
-| `legal.json` | legal / court | fp32 / 4 | batch | court_trial (fine_auto may switch to appellate) | entity number pii events intent act role item state | `event.legal.*` 0.4, `entity.mention.legal_ref` 0.5 | off |
-| `meetings.json` | meetings | fp32 / 4 | batch | meeting | entity number pii events intent act role state | `event.meeting.action_item.recent` 0.35, `event.meeting.decision.recent` 0.4, `intent.assign_task` 0.4 | off |
-| `sports.json` | sports commentary | fp32 / 2 | streaming, ctx 256 | sports (fine_auto: nba nhl nfl soccer cricket) | entity number profanity toxicity events intent state | `event.sports.*` 0.5 | mask profanity |
-| `news.json` | news / talk | fp32 / 2 | batch | news | entity number profanity toxicity events intent role state | none | off |
-| `pii_redaction.json` | generic PII redaction | fp32 / 4 | batch | auto | pii safety | none (PII head already at the 0.3 floor) | mask (default policy) |
-| `edge_low_latency.json` | low-latency edge | **int8 / 1** | streaming, ctx 96 | auto | entity number pii profanity toxicity events intent act safety | none | off |
-| `kids_game.json` | kids apps and games | **int8 / 1** | streaming, ctx 64 | kids (guard on; `command_context` per turn) | profanity toxicity pii safety intent emotion | kids thresholds (built in / `arctag_kids.json`) | off |
+**Redaction**: `"mask"` masks all PII except public contacts, plus profanity and toxicity. A policy sets each category
+to `mask`, `tag` or `off`, e.g. `phone=mask,name=mask,contact=off` or `{"mode": "mask", "policy": {...}}`.
 
-Each config's `_notes` explains its choices. Copy one and edit it for your own use: change the domain, drop sections you
-don't need with `emit`, and move a threshold down for recall or up for precision.
+| category | tag | mask |
+|---|---|---|
+| `phone`, `email`, `address` | `safety.pii.phone_number`, `.email`, `.street_address` | `[PHONE]`, `[EMAIL]`, `[ADDRESS]` |
+| `card`, `gov_id`, `dob` | `safety.pii.card_account_number`, `.gov_id`, `.date_of_birth` | `[CARD]`, `[GOV_ID]`, `[DOB]` |
+| `name`, `handle`, `contact` | `safety.pii.private_name`, `.url_handle`, `.public_contact` | `[NAME]`, `[HANDLE]`, `[CONTACT]` |
+| `profanity`, `toxicity` | `safety.profanity.*`, `safety.toxicity.*` | `[PROFANITY]`, `[TOXIC]` |
 
 ## Output JSON
 
@@ -200,70 +143,45 @@ don't need with `emit`, and move a threshold down for recall or up for precision
 
 ```jsonc
 {
-  "profile": "meeting:meeting",          // ui:fine profile used (fine_auto may switch it inside sports / court)
+  "profile": "meeting:meeting",          // profile used (fine_auto may switch it inside sports / court)
   "n_words": 13,
   "words": ["Call", "me", ...],
   "spans": [{
-     "type": "safety.pii.phone_number",  // ontology tag
-     "family": "pii",                    // entity | number | pii | profanity | toxicity
-     "start": 3, "end": 6,               // word range [start, end)
-     "text": "555 123 4567",
-     "score": 0.999998, "thr": 0.6,      // decision score and the threshold it passed
+     "type": "safety.pii.phone_number", "family": "pii",   // family: entity | number | pii | profanity | toxicity
+     "start": 3, "end": 6, "text": "555 123 4567",         // word range [start, end)
+     "score": 0.999998, "thr": 0.6,
      "src": "head",                      // head = span-head decode; span_in = per-word run decode
-     "alt": {"tag": "safety.pii.gov_id", "p": 3e-06},   // runner-up type (head spans)
+     "alt": {"tag": "safety.pii.gov_id", "p": 3e-06},       // runner-up type
      "ver": 0.69                         // span verifier probability
   }],
   "events": [{"type": "event.meeting.action_item.recent", "q": "ev_rec", "word": 9, "score": 0.81, "thr": 0.35, "text": "Friday."}],
   "utterances": [{
      "start": 0, "end": 7, "text": "...",
-     "intent":    [{"tag": "intent.request_action", "p": 0.88, "thr": 0.5, "on": true}, ...],
-     "act":       [...],                 // discourse.act.*
-     "safety":    [...],                 // safety.* utterance flags (scam, pii.leak / request, threat, crisis, child, jailbreak, ...)
-     "emotion":   [...], "arousal": [...], "valence": [...], "intensity": [...],   // affect groups, best first (top-1 is the read-out)
-     "role":      [...],                 // speaker.role.* of the utterance's speaker (needs spk on the words)
-     "item":      [...],                 // item.* (case area, esports title)
-     "state":     {"content.mode": [...], "content.game_state": [...], ...}       // content state groups at the utterance end
+     "intent": [{"tag": "intent.request_action", "p": 0.88, "thr": 0.5, "on": true}, ...],
+     "act": [...], "safety": [...],
+     "emotion": [...], "arousal": [...], "valence": [...], "intensity": [...],   // top-1 is the read-out
+     "role": [...], "item": [...],
+     "state": {"content.mode": [...], "content.game_state": [...], ...}
   }],
-  "redacted_text": "Call me at [PHONE] tomorrow. ..."   // only when redaction is on
+  "redacted_text": "Call me at [PHONE] tomorrow. ..."    // only when redaction is on
 }
 ```
 
-Read-out lists are sorted best first. `on` means `p >= thr` for the active profile, after any overrides. Utterances end
-at a word ending in `.`, `?` or `!`, at a per-word `"eou": true`, or at a streaming endpoint. `emit` and `tags` remove
-sections and entries from the output. They never change what is computed.
+Read-out lists are sorted best first; `on` means `p >= thr` for the active profile and overrides. Utterances end at
+`.`, `?` or `!`, at `"eou": true`, or at a streaming endpoint. `emit` and `tags` only remove output; they never change
+what is computed.
 
-`arctag_poll` returns:
+`arctag_poll` returns `{"n_words", "a0", "profile", "spans", "events", "utterances", "current", "redacted_text"}`:
+drop your spans with `end > a0` and append these; `events` are new ones; `utterances` closed since the last poll;
+`current` is the open utterance's running read-out.
 
-```jsonc
-{"n_words": 42, "a0": 30, "profile": "sports:soccer",
- "spans": [...],          // spans with end > a0: drop yours with end > a0 and append these
- "events": [...],         // events not reported before
- "utterances": [...],     // utterances closed since the last poll
- "current": {...} | null, // running read-out of the open utterance
- "redacted_text": "..."}  // words[a0:] redacted (redaction on)
-```
-
-`arctag_info` returns:
-
-```jsonc
-{"version": "0.4.1", "precision": "int8", "model_file": "model/arctag_int8.onnx", "profile": "auto:unknown", "asr": "unknown",
- "threads": 1, "max_ctx": 2048, "stream_ctx": 96, "fine_auto": true, "emit": [...], "tags": [], "redact": "off", "thresholds": {}}
-```
+`arctag_info` returns the handle's settings: `version`, `precision`, `model_file`, `profile`, `backend`, `weights`,
+`kernels` (native: `avx2`, `neon` or `scalar`), `threads`, `max_ctx`, `stream_ctx`, `emit`, `redact`, `thresholds`, ...
 
 ## Tips
 
-- **Pick a domain.** `auto` uses the generic thresholds. On off-domain text the domain-specific heads (sports events,
-  items) can still fire. Either set the domain or use `emit` to drop those sections.
-- **Speaker ids** (`"spk"` on words) enable speaker-change features and speaker roles.
-- **ASR source.** Set `asr` to the recogniser that produced the words when it is one of the listed sources. The model
-  learnt each one's punctuation and casing habits.
-- **Streaming cost.** With the native backend a poll costs about one word's compute (more after a revision of earlier
-  words), so per-word polling is fine. Under ONNX Runtime each poll re-runs the last `stream_ctx` words: a smaller value
-  lowers the per-word cost and shortens the context (`edge_low_latency.json` uses 96), and polling every N words instead
-  of every word also helps.
-
-## Model files and library versions
-
-Use the `onnx/` files from the matching model release: the library version and the model tag are the same
-(`fetch_model.sh` fetches that tag by default). Files from another release can fail to load or decode differently,
-because the read-out columns, thresholds and span families live in `arctag_meta.json`.
+- **Pick a domain**, or use `emit` to drop sections that do not apply.
+- **Speaker ids** (`spk`) enable speaker-change features and roles.
+- **ASR source**: set `asr` when the words come from one of the listed recognisers.
+- **Streaming cost**: with the native backend, per-word polling is fine. Under ONNX Runtime each poll re-runs
+  `stream_ctx` words: lower it or poll every few words.

@@ -1,4 +1,4 @@
-# Kids / game domain and the guard layer
+# Kids and game domain, and the guard layer
 
 Domain `kids` (alias `game`) is for short spoken turns of children talking to a character in an app or game: "copy
 that", "fire the thrusters", "this is stupid", "i want to hurt myself". These turns are much shorter than the sessions the
